@@ -63,6 +63,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "parsed_draft",
     EagleModelTypes,
     NgramGPUTypes,
 ]
@@ -183,6 +184,17 @@ class SpeculativeConfig:
     """The minimum token probability for suffix decoding. Will only speculate
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
+
+    # Parsed-draft speculative decoding configuration
+    parsed_draft_strategy: str = "stop_at_first"
+    """Strategy for parsed-draft speculative decoding. 'stop_at_first' stops
+    at the first mismatch and takes a correction (greedy-exact, identical to
+    autoregressive). 'hybrid' verifies the whole chunk but bails out after
+    max_reject consecutive rejections (Phase 2)."""
+
+    parsed_draft_max_reject: int = 3
+    """Maximum consecutive rejected tokens before bailing out in hybrid
+    strategy. Only used when parsed_draft_strategy='hybrid'."""
 
     draft_load_config: LoadConfig | None = None
     """Load config for the draft model. If not specified, will use the load
@@ -535,6 +547,8 @@ class SpeculativeConfig:
         elif self.method is None:
             if self.model in ("ngram", "[ngram]"):
                 self.method = "ngram"
+            elif self.model in ("parsed_draft", "[parsed_draft]"):
+                self.method = "parsed_draft"
             else:
                 self.method = "draft_model"
 
@@ -564,6 +578,8 @@ class SpeculativeConfig:
                 self.model = "ngram_gpu"
             elif self.method == "suffix":
                 self.model = "suffix"
+            elif self.method == "parsed_draft":
+                self.model = "parsed_draft"
             elif self.method == "extract_hidden_states":
                 self.model = "extract_hidden_states"
             elif self.method == "custom_class":
@@ -617,6 +633,8 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
             self._validate_suffix_decoding()
+        elif self.method == "parsed_draft":
+            self._validate_parsed_draft()
         elif self.method == "custom_class":
             # Custom class proposer does not need a draft model.
             # It will dynamically load the user-provided class at runtime.
@@ -839,6 +857,26 @@ class SpeculativeConfig:
             raise ValueError(
                 f"suffix_decoding_min_token_prob="
                 f"{self.suffix_decoding_min_token_prob} must be in [0, 1]"
+            )
+
+    def _validate_parsed_draft(self):
+        if self.num_speculative_tokens is None:
+            self.num_speculative_tokens = 16
+            logger.warning(
+                "Defaulted num_speculative_tokens to %s for parsed_draft.",
+                self.num_speculative_tokens,
+            )
+        if self.parsed_draft_strategy not in (
+            "stop_at_first",
+            "hybrid",
+        ):
+            raise ValueError(
+                f"parsed_draft_strategy='{self.parsed_draft_strategy}' "
+                "must be 'stop_at_first' or 'hybrid'."
+            )
+        if self.parsed_draft_max_reject < 1:
+            raise ValueError(
+                f"parsed_draft_max_reject={self.parsed_draft_max_reject} must be >= 1"
             )
 
     @staticmethod
@@ -1071,6 +1109,9 @@ class SpeculativeConfig:
     def use_ngram_gpu(self) -> bool:
         return self.method == "ngram_gpu"
 
+    def use_parsed_draft(self) -> bool:
+        return self.method == "parsed_draft"
+
     def __repr__(self) -> str:
         method = self.method
         model = (
@@ -1079,6 +1120,7 @@ class SpeculativeConfig:
             in (
                 "ngram",
                 "suffix",
+                "parsed_draft",
                 "extract_hidden_states",
                 "custom_class",
             )

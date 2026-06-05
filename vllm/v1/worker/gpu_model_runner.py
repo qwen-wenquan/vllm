@@ -186,6 +186,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.parsed_draft import ParsedDraftProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -547,6 +548,7 @@ class GPUModelRunner(
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer
+                | ParsedDraftProposer
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -586,6 +588,8 @@ class GPUModelRunner(
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.use_parsed_draft():
+                self.drafter = ParsedDraftProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -4825,6 +4829,15 @@ class GPUModelRunner(
             assert isinstance(self.drafter, SuffixDecodingProposer)
             draft_token_ids = self.drafter.propose(
                 self.input_batch, sampled_token_ids, slot_mappings=slot_mappings
+            )
+        elif spec_config.use_parsed_draft():
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, ParsedDraftProposer)
+            draft_token_ids = self.drafter.propose(
+                sampled_token_ids,
+                self.requests,
+                self.input_batch,
+                self.tokenizer,
             )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)

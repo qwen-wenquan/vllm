@@ -399,6 +399,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
+    draft_text: str | None = Field(
+        default=None,
+        description=(
+            "Pre-existing text to use as speculative draft "
+            "(e.g., OCR-extracted text from PDF). Only used when "
+            "speculative_config.method='parsed_draft'."
+        ),
+    )
+
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
         description=(
@@ -611,6 +620,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if self.draft_text:
+            # Pass in draft_text via extra_args for parsed-draft spec decode
+            extra_args["draft_text"] = self.draft_text
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

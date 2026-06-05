@@ -15,6 +15,7 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 - [Multi-Layer Perceptron](mlp.md)
 - [N-Gram](n_gram.md)
 - [Suffix Decoding](suffix.md)
+- [Parsed-Draft (OCR)](parsed_draft.md)
 - [Hidden State Extraction](extract_hidden_states.md)
 - [Custom Proposer Backend (Experimental)](#custom-proposer-backend-experimental)
 
@@ -32,6 +33,7 @@ depend on your model family, traffic pattern, hardware, and sampling settings.
 | MLP speculator | Medium to high gain | Medium gain | Good when compatible MLP speculators are available. |
 | N-gram | Low to medium gain | Medium gain | Lightweight and easy to enable. |
 | Suffix decoding | Low to medium gain | Medium gain | No extra draft model; dynamic speculation depth. |
+| Parsed-draft (OCR) | Medium to high gain | Medium gain | Uses pre-existing text as draft; no draft model needed. Best for OCR VL models. |
 | Custom Proposer | Varies | Varies | Bring your own proposer class (experimental). |
 
 For reproducible measurements in your environment, use
@@ -137,6 +139,27 @@ vllm serve <target-model> \
     "suffix_decoding_max_cached_requests": 10000,
     "suffix_decoding_max_spec_factor": 1.0,
     "suffix_decoding_min_token_prob": 0.1
+  }'
+```
+
+#### Parsed-draft (OCR)
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `parsed_draft_strategy` | `string` | `stop_at_first` | `stop_at_first` (greedy-exact) or `hybrid` (whole-chunk with bail-out). |
+| `parsed_draft_max_reject` | `integer >= 1` | `3` | Max consecutive rejections before bail-out in hybrid strategy. |
+
+The `draft_text` is passed per-request via `SamplingParams(extra_args={"draft_text": "..."})`,
+not in `speculative_config`.
+
+Example:
+
+```bash
+vllm serve <target-model> \
+  --speculative-config '{
+    "method": "parsed_draft",
+    "num_speculative_tokens": 16,
+    "parsed_draft_strategy": "stop_at_first"
   }'
 ```
 

@@ -25,7 +25,7 @@ from pathlib import Path
 # ── Imports: vLLM implementation ──────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vllm.v1.spec_decode.parsed_draft import (
+from vllm.v1.spec_decode.parsed_draft import (  # noqa: E402
     IncrementalLCSMatcher,
     _lcs_draft_advance,
 )
@@ -34,8 +34,10 @@ from vllm.v1.spec_decode.parsed_draft import (
 EAGLE_ROOT = Path(__file__).resolve().parent.parent.parent / "EAGLE"
 sys.path.insert(0, str(EAGLE_ROOT))
 
-from eagle.model.parsed_draft_spec_decode import (
+from eagle.model.parsed_draft_spec_decode import (  # noqa: E402
     IncrementalLCSMatcher as EagleLCSMatcher,
+)
+from eagle.model.parsed_draft_spec_decode import (  # noqa: E402
     _lcs_draft_advance as eagle_lcs_draft_advance,
 )
 
@@ -56,8 +58,10 @@ def simulate_stop_at_first(
     n_gt = len(gt_ids)
     if n_draft == 0 or n_gt == 0:
         return {
-            "accepted": 0, "steps": 0,
-            "tokens_produced": 0, "n_gt": n_gt,
+            "accepted": 0,
+            "steps": 0,
+            "tokens_produced": 0,
+            "n_gt": n_gt,
         }
 
     total_accepted = 0
@@ -67,8 +71,8 @@ def simulate_stop_at_first(
     gt_cursor = 0
 
     while draft_cursor < n_draft and gt_cursor < n_gt:
-        chunk_d = draft_ids[draft_cursor:draft_cursor + chunk_size]
-        chunk_g = gt_ids[gt_cursor:gt_cursor + chunk_size]
+        chunk_d = draft_ids[draft_cursor : draft_cursor + chunk_size]
+        chunk_g = gt_ids[gt_cursor : gt_cursor + chunk_size]
         chunk_len = min(len(chunk_d), len(chunk_g))
         if chunk_len == 0:
             break
@@ -95,7 +99,7 @@ def simulate_stop_at_first(
                 # Accept prefix + 1 correction
                 total_accepted += prefix_len
                 total_tokens += prefix_len + 1
-                gt_prefix = chunk_g[:prefix_len + 1]
+                gt_prefix = chunk_g[: prefix_len + 1]
                 advance = lcs_advance_fn(chunk_d, gt_prefix)
                 draft_cursor += max(advance, 1)
                 gt_cursor += prefix_len + 1
@@ -124,8 +128,10 @@ def simulate_hybrid(
     n_gt = len(gt_ids)
     if n_draft == 0 or n_gt == 0:
         return {
-            "accepted": 0, "steps": 0,
-            "tokens_produced": 0, "n_gt": n_gt,
+            "accepted": 0,
+            "steps": 0,
+            "tokens_produced": 0,
+            "n_gt": n_gt,
         }
 
     total_accepted = 0
@@ -135,8 +141,8 @@ def simulate_hybrid(
     gt_cursor = 0
 
     while draft_cursor < n_draft and gt_cursor < n_gt:
-        chunk_d = draft_ids[draft_cursor:draft_cursor + chunk_size]
-        chunk_g = gt_ids[gt_cursor:gt_cursor + chunk_size]
+        chunk_d = draft_ids[draft_cursor : draft_cursor + chunk_size]
+        chunk_g = gt_ids[gt_cursor : gt_cursor + chunk_size]
         chunk_len = min(len(chunk_d), len(chunk_g))
         if chunk_len == 0:
             break
@@ -164,9 +170,7 @@ def simulate_hybrid(
                 if consec_reject >= max_reject:
                     bail_pos = pos - max_reject + 1 + 1
                     n_output = bail_pos
-                    n_accepted = sum(
-                        1 for p in range(bail_pos - 1) if p in matched
-                    )
+                    n_accepted = sum(1 for p in range(bail_pos - 1) if p in matched)
                     break
                 else:
                     n_output += 1
@@ -177,10 +181,7 @@ def simulate_hybrid(
 
         if bail_pos < chunk_len:
             gt_prefix = chunk_g[:bail_pos]
-            advance = (
-                lcs_advance_fn(chunk_d, gt_prefix)
-                if bail_pos > 0 else 1
-            )
+            advance = lcs_advance_fn(chunk_d, gt_prefix) if bail_pos > 0 else 1
             draft_cursor += max(advance, 1)
             gt_cursor += bail_pos
         else:
@@ -203,9 +204,9 @@ def load_blocks(path: str, n: int | None = None) -> list[dict]:
     blocks = data["blocks"]
     # Filter to blocks with meaningful content
     blocks = [
-        b for b in blocks
-        if len(b.get("parsed_ids", [])) > 0
-        and len(b.get("gt_ids", [])) > 0
+        b
+        for b in blocks
+        if len(b.get("parsed_ids", [])) > 0 and len(b.get("gt_ids", [])) > 0
     ]
     if n is not None:
         blocks = blocks[:n]
@@ -223,15 +224,21 @@ def main():
         help="Path to pre-tokenized benchmark data",
     )
     parser.add_argument(
-        "--n", type=int, default=100,
+        "--n",
+        type=int,
+        default=100,
         help="Number of blocks to benchmark (default: 100)",
     )
     parser.add_argument(
-        "--chunk-size", type=int, default=16,
+        "--chunk-size",
+        type=int,
+        default=16,
         help="Draft chunk size in tokens (default: 16, matching vLLM config)",
     )
     parser.add_argument(
-        "--max-reject", type=int, default=3,
+        "--max-reject",
+        type=int,
+        default=3,
         help="Max consecutive rejects for hybrid strategy (default: 3)",
     )
     args = parser.parse_args()
@@ -249,19 +256,21 @@ def main():
     # ── Run both implementations ──────────────────────────────────────
     for cs in chunk_sizes:
         for strategy_name, max_reject in strategies:
-            print(f"{'='*70}")
-            print(
-                f"Strategy: {strategy_name}  |  chunk_size={cs}"
-            )
-            print(f"{'='*70}")
+            print(f"{'=' * 70}")
+            print(f"Strategy: {strategy_name}  |  chunk_size={cs}")
+            print(f"{'=' * 70}")
 
             vllm_stats = {
-                "accepted": 0, "steps": 0,
-                "tokens": 0, "n_gt": 0,
+                "accepted": 0,
+                "steps": 0,
+                "tokens": 0,
+                "n_gt": 0,
             }
             eagle_stats = {
-                "accepted": 0, "steps": 0,
-                "tokens": 0, "n_gt": 0,
+                "accepted": 0,
+                "steps": 0,
+                "tokens": 0,
+                "n_gt": 0,
             }
             mismatches = 0
 
@@ -276,7 +285,9 @@ def main():
                     # stop_at_first
                     t0 = time.perf_counter()
                     v = simulate_stop_at_first(
-                        draft_ids, gt_ids, cs,
+                        draft_ids,
+                        gt_ids,
+                        cs,
                         _lcs_draft_advance,
                         IncrementalLCSMatcher,
                     )
@@ -284,7 +295,9 @@ def main():
 
                     t0 = time.perf_counter()
                     e = simulate_stop_at_first(
-                        draft_ids, gt_ids, cs,
+                        draft_ids,
+                        gt_ids,
+                        cs,
                         eagle_lcs_draft_advance,
                         EagleLCSMatcher,
                     )
@@ -293,7 +306,10 @@ def main():
                     # hybrid
                     t0 = time.perf_counter()
                     v = simulate_hybrid(
-                        draft_ids, gt_ids, cs, max_reject,
+                        draft_ids,
+                        gt_ids,
+                        cs,
+                        max_reject,
                         _lcs_draft_advance,
                         IncrementalLCSMatcher,
                     )
@@ -301,7 +317,10 @@ def main():
 
                     t0 = time.perf_counter()
                     e = simulate_hybrid(
-                        draft_ids, gt_ids, cs, max_reject,
+                        draft_ids,
+                        gt_ids,
+                        cs,
+                        max_reject,
                         eagle_lcs_draft_advance,
                         EagleLCSMatcher,
                     )
@@ -335,81 +354,66 @@ def main():
             v_gt = vllm_stats["n_gt"]
             e_gt = eagle_stats["n_gt"]
 
-            v_rate = (
-                vllm_stats["accepted"] / v_gt * 100 if v_gt else 0
-            )
-            e_rate = (
-                eagle_stats["accepted"] / e_gt * 100 if e_gt else 0
-            )
+            v_rate = vllm_stats["accepted"] / v_gt * 100 if v_gt else 0
+            e_rate = eagle_stats["accepted"] / e_gt * 100 if e_gt else 0
             v_tps = (
-                vllm_stats["tokens"] / vllm_stats["steps"]
-                if vllm_stats["steps"] else 0
+                vllm_stats["tokens"] / vllm_stats["steps"] if vllm_stats["steps"] else 0
             )
             e_tps = (
                 eagle_stats["tokens"] / eagle_stats["steps"]
-                if eagle_stats["steps"] else 0
+                if eagle_stats["steps"]
+                else 0
             )
-            v_speedup = (
-                v_gt / vllm_stats["steps"]
-                if vllm_stats["steps"] else 0
-            )
-            e_speedup = (
-                e_gt / eagle_stats["steps"]
-                if eagle_stats["steps"] else 0
-            )
+            v_speedup = v_gt / vllm_stats["steps"] if vllm_stats["steps"] else 0
+            e_speedup = e_gt / eagle_stats["steps"] if eagle_stats["steps"] else 0
 
             print(f"\n  {'':20s} {'vLLM':>12s} {'EAGLE':>12s} {'Match':>8s}")
-            print(f"  {'─'*55}")
+            print(f"  {'─' * 55}")
             print(
                 f"  {'Accepted tokens':20s} "
                 f"{vllm_stats['accepted']:>12d} "
                 f"{eagle_stats['accepted']:>12d} "
-                f"{'✓' if vllm_stats['accepted']==eagle_stats['accepted'] else '✗':>8s}"
+                f"{'✓' if vllm_stats['accepted'] == eagle_stats['accepted'] else '✗':>8s}"  # noqa: E501
             )
             print(
                 f"  {'Accept rate':20s} "
                 f"{v_rate:>11.1f}% "
                 f"{e_rate:>11.1f}% "
-                f"{'✓' if abs(v_rate-e_rate)<0.01 else '✗':>8s}"
+                f"{'✓' if abs(v_rate - e_rate) < 0.01 else '✗':>8s}"
             )
             print(
                 f"  {'Verify steps':20s} "
                 f"{vllm_stats['steps']:>12d} "
                 f"{eagle_stats['steps']:>12d} "
-                f"{'✓' if vllm_stats['steps']==eagle_stats['steps'] else '✗':>8s}"
+                f"{'✓' if vllm_stats['steps'] == eagle_stats['steps'] else '✗':>8s}"
             )
             print(
                 f"  {'Avg tokens/step':20s} "
                 f"{v_tps:>12.1f} "
                 f"{e_tps:>12.1f} "
-                f"{'✓' if abs(v_tps-e_tps)<0.01 else '✗':>8s}"
+                f"{'✓' if abs(v_tps - e_tps) < 0.01 else '✗':>8s}"
             )
             print(
                 f"  {'Effective speedup':20s} "
                 f"{v_speedup:>11.1f}x "
                 f"{e_speedup:>11.1f}x "
-                f"{'✓' if abs(v_speedup-e_speedup)<0.01 else '✗':>8s}"
+                f"{'✓' if abs(v_speedup - e_speedup) < 0.01 else '✗':>8s}"
             )
             print(
                 f"  {'Wall-clock (ms)':20s} "
-                f"{t_vllm*1000:>11.1f}  "
-                f"{t_eagle*1000:>11.1f}"
+                f"{t_vllm * 1000:>11.1f}  "
+                f"{t_eagle * 1000:>11.1f}"
             )
-            print(
-                f"  {'Block mismatches':20s} "
-                f"{mismatches:>12d} / {n}"
-            )
+            print(f"  {'Block mismatches':20s} {mismatches:>12d} / {n}")
             print()
 
     # ── Final verdict ─────────────────────────────────────────────────
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     if mismatches == 0:
         print("FIDELITY CHECK PASSED: vLLM and EAGLE produce identical results")
     else:
-        print(
-            f"FIDELITY CHECK FAILED: {mismatches} block(s) differ"
-        )
-    print(f"{'='*70}")
+        print(f"FIDELITY CHECK FAILED: {mismatches} block(s) differ")
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":

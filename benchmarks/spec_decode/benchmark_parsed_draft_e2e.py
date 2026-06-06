@@ -25,13 +25,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import sys
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
+
+import pybase64 as base64
 
 # RoPE patch — must run before any transformers/vllm import
 try:
@@ -40,9 +40,7 @@ try:
     if "default" not in ROPE_INIT_FUNCTIONS:
         import torch
 
-        def _compute_default_rope_parameters(
-            config, device=None, **kwargs
-        ):
+        def _compute_default_rope_parameters(config, device=None, **kwargs):
             base = config.rope_theta
             prf = (
                 config.partial_rotary_factor
@@ -57,12 +55,7 @@ try:
             dim = int(head_dim * prf)
             inv_freq = 1.0 / (
                 base
-                ** (
-                    torch.arange(0, dim, 2, dtype=torch.int64)
-                    .float()
-                    .to(device)
-                    / dim
-                )
+                ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
             )
             return inv_freq, 1.0
 
@@ -73,6 +66,7 @@ except ImportError:
 import torch
 from PIL import Image
 from transformers import AutoTokenizer
+
 from vllm import LLM, SamplingParams
 from vllm.entrypoints import chat_utils as vllm_chat_utils
 from vllm.inputs import TokensPrompt
@@ -105,14 +99,10 @@ def preprocess_image_with_padding(
     new_width = width + 2 * pad_size
     new_height = height + 2 * pad_size
     try:
-        padded = Image.new(
-            image.mode, (new_width, new_height), color=(255, 255, 255)
-        )
+        padded = Image.new(image.mode, (new_width, new_height), color=(255, 255, 255))
     except ValueError:
         image = image.convert("RGB")
-        padded = Image.new(
-            image.mode, (new_width, new_height), color=(255, 255, 255)
-        )
+        padded = Image.new(image.mode, (new_width, new_height), color=(255, 255, 255))
     padded.paste(image, (pad_size, pad_size))
     return padded
 
@@ -231,9 +221,7 @@ def load_document_blocks(
 
 
 # ── vLLM request helpers (from eval_vllm.py) ──────────────────────────
-def parse_chat_messages_compat(
-    tokenizer, model_config, messages, content_format
-):
+def parse_chat_messages_compat(tokenizer, model_config, messages, content_format):
     try:
         return parse_chat_messages(
             messages,
@@ -277,9 +265,7 @@ def prepare_request(
     prompt_str = tokenizer.apply_chat_template(
         conversation, tokenize=False, add_generation_prompt=True
     )
-    prompt_token_ids = tokenizer.encode(
-        prompt_str, add_special_tokens=False
-    )
+    prompt_token_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
     request = TokensPrompt(prompt_token_ids=prompt_token_ids)
     if mm_data is not None:
         request["multi_modal_data"] = mm_data
@@ -354,11 +340,6 @@ def main():
         trust_remote_code=True,
     )
     tokenizer.pad_token = tokenizer.eos_token
-    eos_token_id = (
-        tokenizer.eos_token_id
-        if tokenizer.eos_token_id is not None
-        else 2
-    )
 
     llm = LLM(
         model=args.model,
@@ -381,17 +362,13 @@ def main():
 
     for blk in blocks_with_draft:
         try:
-            req = prepare_request(
-                tokenizer, model_config, blk["crop"], blk["prompt"]
-            )
+            req = prepare_request(tokenizer, model_config, blk["crop"], blk["prompt"])
         except Exception as e:
             print(f"  SKIP: {e}")
             continue
 
         # Baseline: no draft_text
-        sp_base = SamplingParams(
-            temperature=0.0, max_tokens=args.max_new_tokens
-        )
+        sp_base = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
         # Parsed-draft: include draft_text in extra_args
         sp_draft = SamplingParams(
             temperature=0.0,
@@ -420,37 +397,25 @@ def main():
     print("Warmup done.\n")
 
     # ── Run baseline (autoregressive) ──────────────────────────────
-    print(f"{'='*60}")
-    print(
-        f"BASELINE: {len(valid_blocks)} blocks, "
-        f"autoregressive (no draft)"
-    )
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
+    print(f"BASELINE: {len(valid_blocks)} blocks, autoregressive (no draft)")
+    print(f"{'=' * 60}")
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     t0 = time.perf_counter()
-    baseline_outputs = llm.generate(
-        requests_baseline, sampling_params=params_baseline
-    )
-    torch.cuda.synchronize()
+    baseline_outputs = llm.generate(requests_baseline, sampling_params=params_baseline)
+    torch.accelerator.synchronize()
     baseline_ms = (time.perf_counter() - t0) * 1000
 
-    baseline_texts = [
-        o.outputs[0].text if o.outputs else "" for o in baseline_outputs
-    ]
+    baseline_texts = [o.outputs[0].text if o.outputs else "" for o in baseline_outputs]
     baseline_token_counts = [
-        len(o.outputs[0].token_ids) if o.outputs else 0
-        for o in baseline_outputs
+        len(o.outputs[0].token_ids) if o.outputs else 0 for o in baseline_outputs
     ]
     total_baseline_tokens = sum(baseline_token_counts)
 
-    print(
-        f"  Time:       {baseline_ms:.0f} ms"
-    )
+    print(f"  Time:       {baseline_ms:.0f} ms")
     print(f"  Tokens:     {total_baseline_tokens}")
-    print(
-        f"  Throughput: {total_baseline_tokens / (baseline_ms / 1000):.1f} tok/s"
-    )
+    print(f"  Throughput: {total_baseline_tokens / (baseline_ms / 1000):.1f} tok/s")
     print(
         f"  Latency:    {baseline_ms / total_baseline_tokens:.2f} ms/tok"
         if total_baseline_tokens
@@ -462,40 +427,30 @@ def main():
     # requires speculative_config). This run just verifies that
     # draft_text flows through without breaking inference, and
     # produces identical output (since it's ignored without spec config).
-    print(f"\n{'='*60}")
-    print(
-        f"WITH DRAFT_TEXT: {len(valid_blocks)} blocks "
-        f"(draft_text in extra_args)"
-    )
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print(f"WITH DRAFT_TEXT: {len(valid_blocks)} blocks (draft_text in extra_args)")
+    print(f"{'=' * 60}")
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     t0 = time.perf_counter()
-    draft_outputs = llm.generate(
-        requests_draft, sampling_params=params_draft
-    )
-    torch.cuda.synchronize()
+    draft_outputs = llm.generate(requests_draft, sampling_params=params_draft)
+    torch.accelerator.synchronize()
     draft_ms = (time.perf_counter() - t0) * 1000
 
-    draft_texts = [
-        o.outputs[0].text if o.outputs else "" for o in draft_outputs
-    ]
+    draft_texts = [o.outputs[0].text if o.outputs else "" for o in draft_outputs]
     draft_token_counts = [
-        len(o.outputs[0].token_ids) if o.outputs else 0
-        for o in draft_outputs
+        len(o.outputs[0].token_ids) if o.outputs else 0 for o in draft_outputs
     ]
     total_draft_tokens = sum(draft_token_counts)
 
     print(f"  Time:       {draft_ms:.0f} ms")
     print(f"  Tokens:     {total_draft_tokens}")
-    print(
-        f"  Throughput: {total_draft_tokens / (draft_ms / 1000):.1f} tok/s"
-    )
+    print(f"  Throughput: {total_draft_tokens / (draft_ms / 1000):.1f} tok/s")
 
     # ── Compare outputs ────────────────────────────────────────────
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("COMPARISON")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     exact_matches = 0
     total_edit_dist = 0
@@ -507,43 +462,29 @@ def main():
         ed = edit_distance(bt, dt)
         total_edit_dist += ed
         if bt != dt and i < 3:
-            print(
-                f"\n  Block {i} ({blk['category_name']}) DIFFERS:"
-            )
+            print(f"\n  Block {i} ({blk['category_name']}) DIFFERS:")
             print(f"    baseline: {bt[:80]!r}")
             print(f"    w/draft:  {dt[:80]!r}")
             print(f"    edit_dist: {ed}")
 
     n = len(valid_blocks)
     print(f"\n  Blocks:           {n}")
-    print(
-        f"  Exact match:      {exact_matches}/{n} "
-        f"({exact_matches/n*100:.1f}%)"
-    )
-    print(
-        f"  Mean edit dist:   {total_edit_dist/n:.1f} chars"
-    )
-    print(
-        f"  Baseline time:    {baseline_ms:.0f} ms"
-    )
-    print(
-        f"  With-draft time:  {draft_ms:.0f} ms"
-    )
+    print(f"  Exact match:      {exact_matches}/{n} ({exact_matches / n * 100:.1f}%)")
+    print(f"  Mean edit dist:   {total_edit_dist / n:.1f} chars")
+    print(f"  Baseline time:    {baseline_ms:.0f} ms")
+    print(f"  With-draft time:  {draft_ms:.0f} ms")
 
     # ── Per-block detail: compare model output vs gt_text ──────────
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SAMPLE OUTPUTS (first 5 blocks)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for i in range(min(5, n)):
         blk = valid_blocks[i]
         bt = baseline_texts[i]
         gt = blk["gt_text"]
         pt = blk["parsed_text"]
         ed_gt = edit_distance(bt, gt)
-        print(
-            f"\n  [{i}] {blk['category_name']} "
-            f"(p{blk['page']}/b{blk['block_idx']})"
-        )
+        print(f"\n  [{i}] {blk['category_name']} (p{blk['page']}/b{blk['block_idx']})")
         print(f"    gt:       {gt[:80]!r}")
         print(f"    parsed:   {pt[:80]!r}")
         print(f"    baseline: {bt[:80]!r}")

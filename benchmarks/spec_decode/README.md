@@ -81,7 +81,7 @@ Pure model forward pass latency (HuggingFace, fresh KV cache clone, no DynamicCa
 concat overhead). These numbers approximate what vLLM's paged KV cache would achieve.
 
 | Operation | Latency | Per token |
-|---|---|---|
+| --- | --- | --- |
 | Decode 1 token | 10.2 ms | 10.2 ms/tok |
 | Verify chunk c=4 | 11.2 ms | 2.8 ms/tok |
 | Verify chunk c=16 | 11.2 ms | 0.7 ms/tok |
@@ -96,7 +96,7 @@ models would show more separation between decode and verify cost.
 Using decode=10.2 ms/step, verify=11.2 ms/step (measured on H100 NVL):
 
 | Strategy | Chunk Size | Verify Steps | Verify Time | AR Time | **Speedup** |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | stop_at_first | 16 | 2,444 | 27.4s | 64.5s | **2.4×** |
 | stop_at_first | 50 | 1,729 | 19.4s | 64.5s | **3.3×** |
 | stop_at_first | 200 | 1,440 | 16.1s | 64.5s | **4.0×** |
@@ -109,7 +109,7 @@ AR time = 6,322 tokens × 10.2 ms. Verify time = steps × 11.2 ms.
 ### Acceptance Rate Simulation
 
 | Strategy | Chunk Size | Accept Rate | Verify Steps | Avg tok/step |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | stop_at_first | 16 | 47.4% | 2,444 | 2.2 |
 | stop_at_first | 50 | 30.4% | 1,729 | 2.1 |
 | stop_at_first | 200 | 20.4% | 1,440 | 1.9 |

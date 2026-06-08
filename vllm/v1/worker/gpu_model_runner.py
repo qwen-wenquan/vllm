@@ -4837,7 +4837,6 @@ class GPUModelRunner(
                 sampled_token_ids,
                 self.requests,
                 self.input_batch,
-                self.tokenizer,
             )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)

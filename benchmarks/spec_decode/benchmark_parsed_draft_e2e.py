@@ -6,27 +6,46 @@ E2E benchmark: vLLM baseline vs parsed-draft speculative decoding.
 
 Loads PaddleOCR-VL via vLLM, processes real document images from GTX5k,
 and compares:
-  - Baseline: autoregressive (no draft_text)
-  - Parsed-draft: same request but with draft_text from mupdf OCR
+  - Baseline: autoregressive decoding (standard LLM)
+  - Parsed-draft: speculative decoding with draft_text from mupdf OCR
 
-Measures wall-clock latency, throughput, and output fidelity.
+Supports three batching modes:
+  - batched (default): all requests in one generate() call
+  - sequential: one request at a time (measures per-request latency)
+  - constrained: batched with max_num_seqs limit
 
 Usage:
-    export CUDA_HOME=/tmp/cuda_home
-    export PATH=".venv/bin:$CUDA_HOME/bin:$PATH"
     export VLLM_USE_FLASHINFER_SAMPLER=0
+    export VLLM_USE_DEEP_GEMM=0
 
-    .venv/bin/python bench/bench_e2e_parsed_draft.py \
-        --model /home/dlisuser/EAGLE/models/PaddleOCR-VL_finetune \
-        --samples-dir /home/dlisuser/EAGLE/models/samples/GTX5k \
+    # Batched (default) — measures throughput
+    .venv/bin/python benchmarks/spec_decode/benchmark_parsed_draft_e2e.py \\
+        --model /path/to/PaddleOCR-VL_finetune \\
+        --samples-dir /path/to/samples/GTX5k \\
         --max-docs 1 --max-blocks 50
+
+    # Sequential — measures per-request latency speedup
+    .venv/bin/python benchmarks/spec_decode/benchmark_parsed_draft_e2e.py \\
+        --model /path/to/PaddleOCR-VL_finetune \\
+        --samples-dir /path/to/samples/GTX5k \\
+        --max-docs 1 --max-blocks 50 \\
+        --sequential
+
+    # Constrained batching — simulate smaller GPU (e.g. A10G)
+    .venv/bin/python benchmarks/spec_decode/benchmark_parsed_draft_e2e.py \\
+        --model /path/to/PaddleOCR-VL_finetune \\
+        --samples-dir /path/to/samples/GTX5k \\
+        --max-docs 5 --max-blocks 200 \\
+        --max-num-seqs 4
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import time
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import cast
@@ -70,11 +89,12 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.entrypoints import chat_utils as vllm_chat_utils
 from vllm.inputs import TokensPrompt
+from vllm.sampling_params import RepetitionDetectionParams
 
 ChatCompletionMessageParam = vllm_chat_utils.ChatCompletionMessageParam
 parse_chat_messages = vllm_chat_utils.parse_chat_messages
 
-# ── Prompt mapping (matches eval_vllm.py) ──────────────────────────────
+# ── Prompt mapping (matches eval_vllm.py) ─────────────────────────
 PROMPT_MAP = {
     9: "Table Recognition:",
     3: "Formula Recognition:",
@@ -87,7 +107,7 @@ def get_prompt(category_id: int) -> str:
     return PROMPT_MAP.get(category_id, DEFAULT_PROMPT)
 
 
-# ── Image utilities (from eval_vllm.py) ────────────────────────────────
+# ── Image utilities (from eval_vllm.py) ───────────────────────────
 def preprocess_image_with_padding(
     image: Image.Image, pad_size: int | None = None
 ) -> Image.Image:
@@ -99,10 +119,18 @@ def preprocess_image_with_padding(
     new_width = width + 2 * pad_size
     new_height = height + 2 * pad_size
     try:
-        padded = Image.new(image.mode, (new_width, new_height), color=(255, 255, 255))
+        padded = Image.new(
+            image.mode,
+            (new_width, new_height),
+            color=(255, 255, 255),
+        )
     except ValueError:
         image = image.convert("RGB")
-        padded = Image.new(image.mode, (new_width, new_height), color=(255, 255, 255))
+        padded = Image.new(
+            image.mode,
+            (new_width, new_height),
+            color=(255, 255, 255),
+        )
     padded.paste(image, (pad_size, pad_size))
     return padded
 
@@ -114,7 +142,7 @@ def image_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{b64}"
 
 
-# ── PDF processing (from eval_vllm.py) ─────────────────────────────────
+# ── PDF processing (from eval_vllm.py) ────────────────────────────
 def render_pdf_pages(pdf_path: str, dpi: int = 200) -> dict:
     import fitz
 
@@ -145,8 +173,20 @@ def load_document_blocks(
     dpi: int = 200,
     max_docs: int | None = None,
     max_blocks: int | None = None,
+    require_parsed_text: bool = False,
 ) -> list[dict]:
-    """Load blocks from GTX5k-style document directories."""
+    """Load blocks from GTX5k-style document directories.
+
+    Args:
+        samples_dir: Path to the samples directory.
+        dpi: DPI for PDF rendering.
+        max_docs: Maximum number of documents to load.
+        max_blocks: Maximum total blocks to return.
+        require_parsed_text: If True, skip blocks where
+            parsed_text is empty. Useful for spec-decode
+            benchmarks where blocks without OCR text
+            cannot use draft tokens.
+    """
     samples_path = Path(samples_dir)
 
     doc_dirs = sorted(
@@ -192,6 +232,8 @@ def load_document_blocks(
                 gt_text = blk.get("gt_text", "").strip()
                 if not gt_text:
                     continue
+                if require_parsed_text and not parsed_text:
+                    continue
                 if pdf_page not in page_images:
                     continue
 
@@ -220,7 +262,7 @@ def load_document_blocks(
     return blocks
 
 
-# ── vLLM request helpers (from eval_vllm.py) ──────────────────────────
+# ── vLLM request helpers (from eval_vllm.py) ─────────────────────
 def parse_chat_messages_compat(tokenizer, model_config, messages, content_format):
     try:
         return parse_chat_messages(
@@ -260,10 +302,15 @@ def prepare_request(
         ],
     )
     conversation, mm_data, mm_uuids = parse_chat_messages_compat(
-        tokenizer, model_config, messages, content_format="openai"
+        tokenizer,
+        model_config,
+        messages,
+        content_format="openai",
     )
     prompt_str = tokenizer.apply_chat_template(
-        conversation, tokenize=False, add_generation_prompt=True
+        conversation,
+        tokenize=False,
+        add_generation_prompt=True,
     )
     prompt_token_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
     request = TokensPrompt(prompt_token_ids=prompt_token_ids)
@@ -274,7 +321,34 @@ def prepare_request(
     return request
 
 
-# ── Edit distance ──────────────────────────────────────────────────────
+def prepare_all_requests(
+    blocks: list[dict],
+    tokenizer,
+    model_config,
+) -> tuple[list[TokensPrompt], list[dict]]:
+    """Prepare vLLM requests for all blocks.
+
+    Returns (requests, valid_blocks) — blocks that failed
+    preparation are skipped.
+    """
+    requests: list[TokensPrompt] = []
+    valid: list[dict] = []
+    for blk in blocks:
+        try:
+            req = prepare_request(
+                tokenizer,
+                model_config,
+                blk["crop"],
+                blk["prompt"],
+            )
+            requests.append(req)
+            valid.append(blk)
+        except Exception as e:
+            print(f"  SKIP: {e}")
+    return requests, valid
+
+
+# ── Edit distance ─────────────────────────────────────────────────
 def edit_distance(a: str, b: str) -> int:
     m, n = len(a), len(b)
     if m == 0:
@@ -295,44 +369,253 @@ def edit_distance(a: str, b: str) -> int:
     return dp[n]
 
 
-# ── Main ───────────────────────────────────────────────────────────────
+# ── Phase stats ───────────────────────────────────────────────────
+@dataclass
+class PhaseStats:
+    """Per-block prefill/decode timing from engine metrics."""
+
+    prefill_ms: float
+    decode_ms: float
+    num_gen_tokens: int
+
+
+def extract_phase_stats(
+    output,
+) -> PhaseStats | None:
+    """Extract prefill/decode times from RequestOutput.metrics.
+
+    Returns None if metrics are unavailable (log_stats
+    disabled).
+    """
+    m = output.metrics
+    if m is None:
+        return None
+    if m.first_token_ts == 0 or m.scheduled_ts == 0:
+        return None
+    prefill_s = m.first_token_ts - m.scheduled_ts
+    decode_s = (
+        m.last_token_ts - m.first_token_ts
+        if m.last_token_ts > m.first_token_ts
+        else 0.0
+    )
+    return PhaseStats(
+        prefill_ms=prefill_s * 1000,
+        decode_ms=decode_s * 1000,
+        num_gen_tokens=m.num_generation_tokens,
+    )
+
+
+# ── Run helpers ───────────────────────────────────────────────────
+def run_inference(
+    llm: LLM,
+    requests: list[TokensPrompt],
+    sampling_params: list[SamplingParams],
+    label: str,
+    sequential: bool = False,
+) -> tuple[list[str], list[int], float, list[PhaseStats | None]]:
+    """Run generate().
+
+    Returns (texts, token_counts, time_ms, phase_stats).
+    phase_stats is a list of per-request PhaseStats (or None
+    when engine metrics are unavailable).
+
+    If sequential=True, runs one request at a time to measure
+    per-request latency (the regime where spec decode shines).
+    """
+    print(f"\n{'=' * 60}")
+    mode = "sequential" if sequential else "batched"
+    print(f"{label} [{mode}]: {len(requests)} blocks")
+    print(f"{'=' * 60}")
+
+    # Warmup — use the actual first sampling params so that
+    # extra_args (e.g. draft_text) are present during warmup.
+    warmup_sp = SamplingParams(
+        temperature=0.0,
+        max_tokens=10,
+        extra_args=(sampling_params[0].extra_args if sampling_params else None),
+    )
+    _ = llm.generate([requests[0]], [warmup_sp])
+
+    torch.accelerator.synchronize()
+    t0 = time.perf_counter()
+
+    if sequential:
+        # One request at a time — measures per-request latency
+        all_outputs = []
+        for req, sp in zip(requests, sampling_params):
+            out = llm.generate([req], [sp])
+            all_outputs.extend(out)
+    else:
+        # All requests in one call — measures throughput
+        all_outputs = llm.generate(requests, sampling_params=sampling_params)
+
+    torch.accelerator.synchronize()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    texts = [o.outputs[0].text if o.outputs else "" for o in all_outputs]
+    token_counts = [
+        len(o.outputs[0].token_ids) if o.outputs else 0 for o in all_outputs
+    ]
+    total_tokens = sum(token_counts)
+
+    # Extract per-request phase stats
+    phase_stats = [extract_phase_stats(o) for o in all_outputs]
+
+    print(f"  Time:       {elapsed_ms:.0f} ms")
+    print(f"  Tokens:     {total_tokens}")
+    if elapsed_ms > 0:
+        tps = total_tokens / (elapsed_ms / 1000)
+        print(f"  Throughput: {tps:.1f} tok/s")
+    if total_tokens > 0:
+        lat = elapsed_ms / total_tokens
+        print(f"  Latency:    {lat:.2f} ms/tok")
+    if sequential and len(requests) > 0:
+        avg_lat = elapsed_ms / len(requests)
+        print(f"  Avg/block:  {avg_lat:.0f} ms")
+
+    # Print phase breakdown if available
+    valid_phases = [p for p in phase_stats if p is not None]
+    if valid_phases:
+        total_prefill = sum(p.prefill_ms for p in valid_phases)
+        total_decode = sum(p.decode_ms for p in valid_phases)
+        avg_prefill = total_prefill / len(valid_phases)
+        avg_decode = total_decode / len(valid_phases)
+        print("  --- Phase breakdown (engine timestamps) ---")
+        print(
+            f"  Total prefill: {total_prefill:.0f} ms  (avg {avg_prefill:.1f} ms/block)"
+        )
+        print(
+            f"  Total decode:  {total_decode:.0f} ms  (avg {avg_decode:.1f} ms/block)"
+        )
+        overhead = elapsed_ms - total_prefill - total_decode
+        print(f"  Overhead:      {overhead:.0f} ms  (scheduling, IPC, tokenization)")
+
+    return texts, token_counts, elapsed_ms, phase_stats
+
+
+# ── Main ──────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="E2E benchmark: baseline vs parsed-draft"
+        description=("E2E benchmark: baseline vs parsed-draft speculative decoding"),
     )
     parser.add_argument(
         "--model",
-        default="/home/dlisuser/EAGLE/models/PaddleOCR-VL_finetune",
+        default=("/home/dlisuser/EAGLE/models/PaddleOCR-VL_finetune"),
     )
     parser.add_argument(
         "--samples-dir",
-        default="/home/dlisuser/EAGLE/models/samples/GTX5k",
+        default=("/home/dlisuser/EAGLE/models/samples/GTX5k"),
     )
     parser.add_argument("--max-docs", type=int, default=1)
     parser.add_argument("--max-blocks", type=int, default=50)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--dpi", type=int, default=200)
+
+    # Speculative decoding configuration
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=50,
+        help="Draft chunk size in tokens (default: 50)",
+    )
+    parser.add_argument(
+        "--parsed-draft-strategy",
+        type=str,
+        default="stop_at_first",
+        choices=["stop_at_first", "hybrid"],
+        help=("Parsed-draft decoding strategy (default: stop_at_first)"),
+    )
+    parser.add_argument(
+        "--parsed-draft-max-reject",
+        type=int,
+        default=3,
+        help=(
+            "Max consecutive rejects before bail-out in hybrid strategy (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--repetition-detection",
+        action="store_true",
+        default=True,
+        help="Enable vLLM's built-in repetition detection.",
+    )
+    parser.add_argument(
+        "--measure-phases",
+        action="store_true",
+        default=False,
+        help=(
+            "Break down timing into prefill vs decode "
+            "phases using engine-internal timestamps. "
+            "Implies --sequential and enables log_stats."
+        ),
+    )
+
+    # Batching mode
+    batch_group = parser.add_mutually_exclusive_group()
+    batch_group.add_argument(
+        "--sequential",
+        action="store_true",
+        default=False,
+        help=(
+            "Process one block at a time instead of "
+            "batching all requests. Measures per-request "
+            "latency — the regime where spec decode "
+            "gives the largest speedup."
+        ),
+    )
+    batch_group.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help=(
+            "Limit max concurrent requests in the "
+            "engine (continuous batching constraint). "
+            "Simulates smaller GPUs like A10G. "
+            "E.g. --max-num-seqs 4."
+        ),
+    )
+
     args = parser.parse_args()
 
-    # ── Load blocks from PDFs ──────────────────────────────────────
+    # ── Load blocks from PDFs ─────────────────────────────────
     print(f"Loading blocks from {args.samples_dir}...")
     blocks = load_document_blocks(
         args.samples_dir,
         dpi=args.dpi,
         max_docs=args.max_docs,
         max_blocks=args.max_blocks,
+        require_parsed_text=True,
     )
-    # Only keep blocks with parsed_text (for draft comparison)
-    blocks_with_draft = [b for b in blocks if b["parsed_text"]]
-    blocks_without_draft = [b for b in blocks if not b["parsed_text"]]
-    print(
-        f"Loaded {len(blocks)} blocks "
-        f"({len(blocks_with_draft)} with parsed_text, "
-        f"{len(blocks_without_draft)} without)"
-    )
+    print(f"Loaded {len(blocks)} blocks (all with parsed_text)")
+    if not blocks:
+        print("No blocks with parsed_text to benchmark.")
+        return
 
-    # ── Load vLLM ──────────────────────────────────────────────────
-    print(f"\nLoading model: {args.model}")
+    # Build repetition detection params if enabled
+    rep_params = None
+    if args.repetition_detection:
+        rep_params = RepetitionDetectionParams(
+            max_pattern_size=10,
+            min_count=5,
+        )
+        print("Repetition detection enabled: max_pattern_size=10, min_count=5")
+
+    # --measure-phases implies sequential mode
+    if args.measure_phases:
+        args.sequential = True
+
+    # Print batching mode
+    if args.sequential:
+        print("Batching mode: SEQUENTIAL (1 req at a time)")
+    elif args.max_num_seqs:
+        print(f"Batching mode: CONSTRAINED (max_num_seqs={args.max_num_seqs})")
+    else:
+        print("Batching mode: BATCHED (all at once)")
+    if args.measure_phases:
+        print("Phase measurement: ENABLED")
+
+    # Load tokenizer once (shared across both LLM instances)
+    print(f"\nLoading tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
         padding_side="left",
@@ -341,7 +624,8 @@ def main():
     )
     tokenizer.pad_token = tokenizer.eos_token
 
-    llm = LLM(
+    # Common LLM kwargs
+    llm_kwargs: dict = dict(
         model=args.model,
         trust_remote_code=True,
         max_model_len=4096,
@@ -349,148 +633,236 @@ def main():
         gpu_memory_utilization=0.9,
         enable_prefix_caching=False,
     )
-    model_config = llm.llm_engine.model_config
-    print("Model loaded.\n")
+    if args.max_num_seqs is not None:
+        llm_kwargs["max_num_seqs"] = args.max_num_seqs
+    if args.measure_phases:
+        # Enable engine stats so RequestOutput.metrics
+        # has prefill/decode timestamps.
+        llm_kwargs["disable_log_stats"] = False
 
-    # ── Prepare requests ───────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # PHASE 1: Baseline (autoregressive, no speculative config)
+    # ══════════════════════════════════════════════════════════
+    print(f"\n{'#' * 60}")
+    print("# PHASE 1: Loading baseline LLM (no spec decode)")
+    print(f"{'#' * 60}")
+
+    llm_baseline = LLM(**llm_kwargs)
+    model_config = llm_baseline.llm_engine.model_config
+
+    # Prepare requests against baseline model_config
     print("Preparing requests...")
-    requests_baseline: list[TokensPrompt] = []
-    requests_draft: list[TokensPrompt] = []
-    params_baseline: list[SamplingParams] = []
-    params_draft: list[SamplingParams] = []
-    valid_blocks: list[dict] = []
-
-    for blk in blocks_with_draft:
-        try:
-            req = prepare_request(tokenizer, model_config, blk["crop"], blk["prompt"])
-        except Exception as e:
-            print(f"  SKIP: {e}")
-            continue
-
-        # Baseline: no draft_text
-        sp_base = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
-        # Parsed-draft: include draft_text in extra_args
-        sp_draft = SamplingParams(
-            temperature=0.0,
-            max_tokens=args.max_new_tokens,
-            extra_args={"draft_text": blk["parsed_text"]},
-        )
-
-        requests_baseline.append(req)
-        requests_draft.append(req)
-        params_baseline.append(sp_base)
-        params_draft.append(sp_draft)
-        valid_blocks.append(blk)
-
-    print(f"Prepared {len(valid_blocks)} request pairs\n")
+    baseline_requests, valid_blocks = prepare_all_requests(
+        blocks, tokenizer, model_config
+    )
+    print(f"Prepared {len(valid_blocks)} requests")
 
     if not valid_blocks:
         print("No valid blocks to benchmark.")
+        del llm_baseline
         return
 
-    # ── Warmup ─────────────────────────────────────────────────────
-    print("Warming up...")
-    _ = llm.generate(
-        [requests_baseline[0]],
-        [SamplingParams(temperature=0.0, max_tokens=10)],
-    )
-    print("Warmup done.\n")
-
-    # ── Run baseline (autoregressive) ──────────────────────────────
-    print(f"{'=' * 60}")
-    print(f"BASELINE: {len(valid_blocks)} blocks, autoregressive (no draft)")
-    print(f"{'=' * 60}")
-
-    torch.accelerator.synchronize()
-    t0 = time.perf_counter()
-    baseline_outputs = llm.generate(requests_baseline, sampling_params=params_baseline)
-    torch.accelerator.synchronize()
-    baseline_ms = (time.perf_counter() - t0) * 1000
-
-    baseline_texts = [o.outputs[0].text if o.outputs else "" for o in baseline_outputs]
-    baseline_token_counts = [
-        len(o.outputs[0].token_ids) if o.outputs else 0 for o in baseline_outputs
+    # Build baseline sampling params (no draft_text)
+    baseline_params = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=args.max_new_tokens,
+            repetition_detection=rep_params,
+        )
+        for _ in valid_blocks
     ]
-    total_baseline_tokens = sum(baseline_token_counts)
 
-    print(f"  Time:       {baseline_ms:.0f} ms")
-    print(f"  Tokens:     {total_baseline_tokens}")
-    print(f"  Throughput: {total_baseline_tokens / (baseline_ms / 1000):.1f} tok/s")
+    baseline_texts, baseline_tokens, baseline_ms, bl_phases = run_inference(
+        llm_baseline,
+        baseline_requests,
+        baseline_params,
+        "BASELINE (autoregressive)",
+        sequential=args.sequential,
+    )
+
+    # Free baseline LLM to make room for spec-decode LLM
+    del llm_baseline
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+    # ══════════════════════════════════════════════════════════
+    # PHASE 2: Parsed-draft speculative decoding
+    # ══════════════════════════════════════════════════════════
+    spec_config = {
+        "model": "parsed_draft",
+        "num_speculative_tokens": (args.num_speculative_tokens),
+        "parsed_draft_strategy": (args.parsed_draft_strategy),
+        "parsed_draft_max_reject": (args.parsed_draft_max_reject),
+    }
+
+    print(f"\n{'#' * 60}")
+    print("# PHASE 2: Loading spec-decode LLM")
+    print(f"#   speculative_config = {spec_config}")
+    print(f"{'#' * 60}")
+
+    llm_spec = LLM(
+        **llm_kwargs,
+        speculative_config=spec_config,
+    )
+    spec_model_config = llm_spec.llm_engine.model_config
+
+    # Re-prepare requests against spec-decode model_config
+    print("Preparing requests for spec-decode engine...")
+    spec_requests, spec_valid_blocks = prepare_all_requests(
+        valid_blocks, tokenizer, spec_model_config
+    )
+
+    # Pre-tokenize draft text BEFORE the timed run so
+    # tokenizer cost is not counted in the speedup.
+    print("Pre-tokenizing draft text...")
+    draft_token_ids_per_block: list[list[int]] = []
+    for blk in spec_valid_blocks:
+        ids = tokenizer.encode(blk["parsed_text"], add_special_tokens=False)
+        draft_token_ids_per_block.append(ids)
+    total_draft_tokens = sum(len(ids) for ids in draft_token_ids_per_block)
     print(
-        f"  Latency:    {baseline_ms / total_baseline_tokens:.2f} ms/tok"
-        if total_baseline_tokens
-        else ""
+        f"  {len(draft_token_ids_per_block)} blocks, "
+        f"{total_draft_tokens} draft tokens total"
     )
 
-    # ── Run with draft_text in extra_args ──────────────────────────
-    # NOTE: This doesn't trigger parsed-draft spec decode yet (that
-    # requires speculative_config). This run just verifies that
-    # draft_text flows through without breaking inference, and
-    # produces identical output (since it's ignored without spec config).
-    print(f"\n{'=' * 60}")
-    print(f"WITH DRAFT_TEXT: {len(valid_blocks)} blocks (draft_text in extra_args)")
-    print(f"{'=' * 60}")
-
-    torch.accelerator.synchronize()
-    t0 = time.perf_counter()
-    draft_outputs = llm.generate(requests_draft, sampling_params=params_draft)
-    torch.accelerator.synchronize()
-    draft_ms = (time.perf_counter() - t0) * 1000
-
-    draft_texts = [o.outputs[0].text if o.outputs else "" for o in draft_outputs]
-    draft_token_counts = [
-        len(o.outputs[0].token_ids) if o.outputs else 0 for o in draft_outputs
+    # Build spec-decode sampling params with pre-tokenized IDs
+    spec_params = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=args.max_new_tokens,
+            extra_args={"draft_token_ids": draft_ids},
+            repetition_detection=rep_params,
+        )
+        for draft_ids in draft_token_ids_per_block
     ]
-    total_draft_tokens = sum(draft_token_counts)
 
-    print(f"  Time:       {draft_ms:.0f} ms")
-    print(f"  Tokens:     {total_draft_tokens}")
-    print(f"  Throughput: {total_draft_tokens / (draft_ms / 1000):.1f} tok/s")
+    spec_texts, spec_tokens, spec_ms, sp_phases = run_inference(
+        llm_spec,
+        spec_requests,
+        spec_params,
+        (
+            f"PARSED-DRAFT SPEC DECODE "
+            f"(strategy={args.parsed_draft_strategy}, "
+            f"chunk={args.num_speculative_tokens})"
+        ),
+        sequential=args.sequential,
+    )
 
-    # ── Compare outputs ────────────────────────────────────────────
+    del llm_spec
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+    # ══════════════════════════════════════════════════════════
+    # PHASE 3: Compare outputs
+    # ══════════════════════════════════════════════════════════
+    n = min(len(baseline_texts), len(spec_texts))
+
     print(f"\n{'=' * 60}")
     print("COMPARISON")
     print(f"{'=' * 60}")
 
     exact_matches = 0
     total_edit_dist = 0
-    for i, blk in enumerate(valid_blocks):
+    for i in range(n):
         bt = baseline_texts[i]
-        dt = draft_texts[i]
-        if bt == dt:
+        st = spec_texts[i]
+        if bt == st:
             exact_matches += 1
-        ed = edit_distance(bt, dt)
+        ed = edit_distance(bt, st)
         total_edit_dist += ed
-        if bt != dt and i < 3:
+        if bt != st and i < 3:
+            blk = valid_blocks[i]
             print(f"\n  Block {i} ({blk['category_name']}) DIFFERS:")
-            print(f"    baseline: {bt[:80]!r}")
-            print(f"    w/draft:  {dt[:80]!r}")
+            print(f"    baseline:  {bt[:80]!r}")
+            print(f"    spec:      {st[:80]!r}")
             print(f"    edit_dist: {ed}")
 
-    n = len(valid_blocks)
+    total_baseline = sum(baseline_tokens[:n])
+    total_spec = sum(spec_tokens[:n])
+    baseline_tps = total_baseline / (baseline_ms / 1000) if baseline_ms > 0 else 0
+    spec_tps = total_spec / (spec_ms / 1000) if spec_ms > 0 else 0
+    speedup = baseline_ms / spec_ms if spec_ms > 0 else 0
+
     print(f"\n  Blocks:           {n}")
     print(f"  Exact match:      {exact_matches}/{n} ({exact_matches / n * 100:.1f}%)")
     print(f"  Mean edit dist:   {total_edit_dist / n:.1f} chars")
     print(f"  Baseline time:    {baseline_ms:.0f} ms")
-    print(f"  With-draft time:  {draft_ms:.0f} ms")
+    print(f"  Spec-decode time: {spec_ms:.0f} ms")
+    print(f"  Baseline tok/s:   {baseline_tps:.1f}")
+    print(f"  Spec-decode tok/s:{spec_tps:.1f}")
+    print(f"  Speedup:          {speedup:.2f}x")
 
-    # ── Per-block detail: compare model output vs gt_text ──────────
+    # ── Phase breakdown (prefill vs decode) ───────────────────
+    bl_valid = [p for p in bl_phases[:n] if p is not None]
+    sp_valid = [p for p in sp_phases[:n] if p is not None]
+    if bl_valid and sp_valid:
+        bl_prefill = sum(p.prefill_ms for p in bl_valid)
+        bl_decode = sum(p.decode_ms for p in bl_valid)
+        sp_prefill = sum(p.prefill_ms for p in sp_valid)
+        sp_decode = sum(p.decode_ms for p in sp_valid)
+
+        avg_bl_pre = bl_prefill / len(bl_valid)
+        avg_bl_dec = bl_decode / len(bl_valid)
+        avg_sp_pre = sp_prefill / len(sp_valid)
+        avg_sp_dec = sp_decode / len(sp_valid)
+
+        decode_speedup = bl_decode / sp_decode if sp_decode > 0 else 0
+
+        bl_overhead = baseline_ms - bl_prefill - bl_decode
+        sp_overhead = spec_ms - sp_prefill - sp_decode
+
+        print(f"\n  {'─' * 56}")
+        print("  PHASE BREAKDOWN (engine timestamps)")
+        print(f"  {'─' * 56}")
+        print(f"  {'':20s} {'Baseline':>12s} {'Spec':>12s} {'Speedup':>8s}")
+        print(
+            f"  {'Prefill (ms)':20s} {bl_prefill:>12.0f} {sp_prefill:>12.0f} {'—':>8s}"
+        )
+        print(
+            f"  {'Decode (ms)':20s} "
+            f"{bl_decode:>12.0f} "
+            f"{sp_decode:>12.0f} "
+            f"{decode_speedup:>7.2f}x"
+        )
+        print(
+            f"  {'Overhead (ms)':20s} "
+            f"{bl_overhead:>12.0f} "
+            f"{sp_overhead:>12.0f} "
+            f"{'—':>8s}"
+        )
+        print(f"  {'Avg prefill/blk':20s} {avg_bl_pre:>11.1f}  {avg_sp_pre:>11.1f}")
+        print(f"  {'Avg decode/blk':20s} {avg_bl_dec:>11.1f}  {avg_sp_dec:>11.1f}")
+        print(f"\n  Decode-only speedup: {decode_speedup:.2f}x")
+        if baseline_ms > 0:
+            pct_prefill = bl_prefill / baseline_ms * 100
+            pct_decode = bl_decode / baseline_ms * 100
+            pct_overhead = bl_overhead / baseline_ms * 100
+            print(
+                f"  Baseline time split: "
+                f"{pct_prefill:.0f}% prefill, "
+                f"{pct_decode:.0f}% decode, "
+                f"{pct_overhead:.0f}% overhead"
+            )
+    elif args.measure_phases:
+        print("\n  WARNING: No phase stats available. Check that log_stats is enabled.")
+
+    # ── Per-block detail ──────────────────────────────────────
     print(f"\n{'=' * 60}")
     print("SAMPLE OUTPUTS (first 5 blocks)")
     print(f"{'=' * 60}")
     for i in range(min(5, n)):
         blk = valid_blocks[i]
         bt = baseline_texts[i]
+        st = spec_texts[i]
         gt = blk["gt_text"]
-        pt = blk["parsed_text"]
-        ed_gt = edit_distance(bt, gt)
+        ed_bl_gt = edit_distance(bt, gt)
+        ed_sp_gt = edit_distance(st, gt)
         print(f"\n  [{i}] {blk['category_name']} (p{blk['page']}/b{blk['block_idx']})")
         print(f"    gt:       {gt[:80]!r}")
-        print(f"    parsed:   {pt[:80]!r}")
+        print(f"    parsed:   {blk['parsed_text'][:80]!r}")
         print(f"    baseline: {bt[:80]!r}")
-        print(f"    edit(bl,gt): {ed_gt}")
-
-    del llm
+        print(f"    spec:     {st[:80]!r}")
+        print(f"    edit(baseline,gt): {ed_bl_gt}  edit(spec,gt): {ed_sp_gt}")
 
 
 if __name__ == "__main__":

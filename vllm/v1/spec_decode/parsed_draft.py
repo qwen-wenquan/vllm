@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from transformers import AutoTokenizer
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -212,16 +213,30 @@ class IncrementalLCSMatcher:
 class ParsedDraftProvider:
     """Manages parsed text as a draft token source.
 
-    Tokenizes once upfront, then serves chunks via a simple token
-    cursor. After verification, the cursor is advanced using LCS
+    Serves chunks of draft token IDs via a simple cursor.
+    After verification, the cursor is advanced using LCS
     alignment to skip past OCR insertions/deletions.
+
+    Accepts either pre-tokenized IDs (preferred — avoids
+    tokenizer overhead in the engine loop) or raw text
+    (tokenized once on construction).
     """
 
-    def __init__(self, draft_text: str, tokenizer: Any):
-        self.draft_text = draft_text
-        self.draft_ids: list[int] = tokenizer.encode(
-            draft_text, add_special_tokens=False
-        )
+    def __init__(
+        self,
+        draft_ids: list[int] | None = None,
+        draft_text: str | None = None,
+        tokenizer: Any = None,
+    ):
+        if draft_ids is not None:
+            self.draft_ids = draft_ids
+        elif draft_text is not None and tokenizer is not None:
+            self.draft_ids = tokenizer.encode(draft_text, add_special_tokens=False)
+        else:
+            raise ValueError(
+                "ParsedDraftProvider requires either "
+                "draft_ids or (draft_text + tokenizer)"
+            )
         self.cursor: int = 0
 
     def get_next_chunk(self, max_tokens: int) -> list[int]:
@@ -272,12 +287,28 @@ class ParsedDraftProposer:
         # cursor advancement can use LCS alignment on the next call.
         self._last_proposed: dict[str, list[int]] = {}
 
+        # Load tokenizer for converting draft_text to token ids.
+        # The tokenizer is loaded here (in the EngineCore process)
+        # because draft_text arrives via SamplingParams.extra_args
+        # and must be tokenized when the provider is first created.
+        model_config = vllm_config.model_config
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_config.tokenizer if model_config.tokenizer else model_config.model,
+            trust_remote_code=model_config.trust_remote_code,
+        )
+        logger.info(
+            "ParsedDraftProposer initialized: "
+            "chunk_size=%d, strategy=%s, max_reject=%d",
+            self.chunk_size,
+            self.strategy,
+            self.max_reject,
+        )
+
     def propose(
         self,
         sampled_token_ids: list[list[int]],
         requests: dict[str, Any],
         input_batch: InputBatch,
-        tokenizer: Any,
     ) -> list[list[int]]:
         """Return draft token IDs per request from parsed text cursors.
 
@@ -286,7 +317,6 @@ class ParsedDraftProposer:
                 step. Empty list means partial prefill (skip).
             requests: Dict mapping req_id → CachedRequestState.
             input_batch: Current InputBatch with req_ids and metadata.
-            tokenizer: Tokenizer for converting draft_text to token ids.
 
         Returns:
             list[list[int]]: Draft token ids per request. Empty list for
@@ -304,7 +334,7 @@ class ParsedDraftProposer:
                 draft_token_ids.append([])
                 continue
 
-            provider = self._get_or_create_provider(req_id, requests, tokenizer)
+            provider = self._get_or_create_provider(req_id, requests)
             if provider is None or provider.is_exhausted():
                 draft_token_ids.append([])
                 continue
@@ -337,10 +367,15 @@ class ParsedDraftProposer:
         self,
         req_id: str,
         requests: dict[str, Any],
-        tokenizer: Any,
     ) -> ParsedDraftProvider | None:
         """Get existing provider or create one from request's
-        draft_text."""
+        extra_args.
+
+        Checks for pre-tokenized ``draft_token_ids`` first
+        (list[int]), falling back to ``draft_text`` (str) +
+        tokenizer. Pre-tokenized IDs avoid tokenizer overhead
+        inside the engine loop.
+        """
         if req_id in self._providers:
             return self._providers[req_id]
 
@@ -348,21 +383,39 @@ class ParsedDraftProposer:
         if req_state is None:
             return None
 
-        # Extract draft_text from sampling_params.extra_args
+        # Extract from sampling_params.extra_args
         sp = getattr(req_state, "sampling_params", None)
         if sp is None:
             return None
         extra = getattr(sp, "extra_args", None)
         if extra is None:
             return None
+
+        # Prefer pre-tokenized IDs (no tokenizer needed)
+        draft_ids = extra.get("draft_token_ids")
+        if draft_ids and isinstance(draft_ids, list):
+            provider = ParsedDraftProvider(draft_ids=draft_ids)
+            self._providers[req_id] = provider
+            logger.debug(
+                "Created ParsedDraftProvider for req %s: %d pre-tokenized draft tokens",
+                req_id,
+                len(provider.draft_ids),
+            )
+            return provider
+
+        # Fall back to draft_text + tokenizer
         draft_text = extra.get("draft_text")
         if not draft_text:
             return None
 
-        provider = ParsedDraftProvider(draft_text, tokenizer)
+        provider = ParsedDraftProvider(
+            draft_text=draft_text,
+            tokenizer=self._tokenizer,
+        )
         self._providers[req_id] = provider
         logger.debug(
-            "Created ParsedDraftProvider for req %s: %d draft tokens",
+            "Created ParsedDraftProvider for req %s: "
+            "%d draft tokens (tokenized from text)",
             req_id,
             len(provider.draft_ids),
         )

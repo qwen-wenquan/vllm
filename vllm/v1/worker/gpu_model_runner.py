@@ -3504,6 +3504,24 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        # For parsed-draft with hybrid/stop_at_first strategy,
+        # bypass the standard rejection sampler and use the
+        # LCS-based acceptor which supports both strategies.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_parsed_draft()
+            and isinstance(self.drafter, ParsedDraftProposer)
+        ):
+            # Extract target logits at draft positions
+            assert spec_decode_metadata is not None
+            assert logits is not None
+            target_logits = logits[spec_decode_metadata.target_logits_indices]
+            return self.drafter.accept_tokens(
+                spec_decode_metadata,
+                target_logits,
+                self.input_batch,
+            )
+
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,

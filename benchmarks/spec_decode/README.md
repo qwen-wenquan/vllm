@@ -166,3 +166,51 @@ AR time = 6,322 tokens x 10.2 ms. Verify time = steps x 11.2 ms.
 
 vLLM's LCS implementation produces **identical results** to the EAGLE reference across
 all 6 configurations (0 mismatches on 100 blocks).
+
+### vLLM E2E Results (H100 NVL, 1000 blocks, sequential)
+
+Measured with `benchmark_parsed_draft_e2e.py --sequential --measure-phases` on
+1000 blocks from GTX5k (reparsed with `reparse_ocr_text.py` for clean draft text).
+
+#### stop_at_first (chunk=50)
+
+```text
+  Baseline time:    624,432 ms    Spec-decode time: 391,284 ms
+  Baseline tok/s:   108.4         Spec-decode tok/s: 173.6
+  Overall speedup:  1.60x
+
+  Phase breakdown:
+                           Baseline         Spec     Speedup
+  Prefill (ms)               35,356       26,572          —
+  Decode (ms)               569,614      345,508      1.65x
+  Overhead (ms)              19,461       19,204          —
+
+  Decode-only speedup: 1.65x
+  Baseline time split: 6% prefill, 91% decode, 3% overhead
+```
+
+#### hybrid (mr=3, chunk=50, 20 blocks)
+
+```text
+  Baseline time:    13,267 ms     Spec-decode time: 1,704 ms
+  Overall speedup:  7.79x
+
+  Phase breakdown:
+                           Baseline         Spec     Speedup
+  Prefill (ms)                  880          650          —
+  Decode (ms)                12,035          677     17.78x
+  Overhead (ms)                 352          377          —
+
+  Decode-only speedup: 17.78x
+```
+
+#### Analysis
+
+The 0.3B PaddleOCR-VL model has nearly identical cost for verifying 50 tokens
+vs decoding 1 token (~10ms vs ~11ms) because the GPU is underutilized at this
+model size. This limits stop_at_first's effective speedup. The hybrid strategy
+overcomes this by accepting ~4.9 tokens/step instead of ~2.1, dramatically
+reducing the number of verify rounds.
+
+For larger models (7B+) where verify cost scales with sequence length, both
+strategies will show proportionally larger speedups.

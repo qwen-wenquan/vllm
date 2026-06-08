@@ -20,6 +20,8 @@ from transformers import AutoTokenizer
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
@@ -420,6 +422,139 @@ class ParsedDraftProposer:
             len(provider.draft_ids),
         )
         return provider
+
+    # ------------------------------------------------------------------
+    # Hybrid acceptance (bypass standard rejection sampler)
+    # ------------------------------------------------------------------
+
+    def accept_tokens(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_logits: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        """Accept draft tokens using LCS-based hybrid strategy.
+
+        Instead of stopping at the first mismatch (standard rejection),
+        this method:
+        1. Computes target argmax for each draft position
+        2. Uses LCS alignment to identify matching positions
+        3. Scans left-to-right, accepting matches and including
+           corrections for mismatches
+        4. Bails out after max_reject consecutive rejections
+
+        Only supports greedy decoding (temperature=0).
+
+        Returns SamplerOutput with the same shape as the standard
+        rejection sampler: sampled_token_ids[batch, max_spec_len+1]
+        with PLACEHOLDER_TOKEN_ID for unused slots.
+        """
+        PLACEHOLDER = -1
+
+        draft_token_ids = metadata.draft_token_ids
+        num_draft_tokens = metadata.num_draft_tokens
+        cu_num_draft = metadata.cu_num_draft_tokens
+        batch_size = len(num_draft_tokens)
+        max_spec_len = metadata.max_spec_len
+        device = target_logits.device
+
+        # Compute target argmax for all draft positions
+        target_argmax = target_logits.argmax(dim=-1)
+
+        # Output buffer: [batch_size, max_spec_len + 1]
+        output = torch.full(
+            (batch_size, max_spec_len + 1),
+            PLACEHOLDER,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # Move to CPU for Python-level LCS + scan
+        draft_ids_cpu = draft_token_ids.cpu().tolist()
+        target_ids_cpu = target_argmax.cpu().tolist()
+        cu_num_cpu = cu_num_draft.cpu().tolist()
+
+        output_cpu = output.cpu()
+        for req_idx in range(batch_size):
+            start = cu_num_cpu[req_idx - 1] if req_idx > 0 else 0
+            end = cu_num_cpu[req_idx]
+            n_draft = end - start
+            if n_draft == 0:
+                continue
+
+            draft_chunk = draft_ids_cpu[start:end]
+            target_chunk = target_ids_cpu[start:end]
+
+            accepted = self._hybrid_accept_one(draft_chunk, target_chunk)
+            for i, tok in enumerate(accepted):
+                output_cpu[req_idx, i] = tok
+
+        output = output_cpu.to(device)
+
+        return SamplerOutput(
+            sampled_token_ids=output,
+            logprobs_tensors=None,
+        )
+
+    def _hybrid_accept_one(
+        self,
+        draft_tokens: list[int],
+        target_tokens: list[int],
+    ) -> list[int]:
+        """Hybrid accept for a single request.
+
+        Uses LCS alignment + left-to-right scan with bail-out.
+        Returns the list of accepted/corrected token IDs.
+        """
+        chunk_len = min(len(draft_tokens), len(target_tokens))
+        if chunk_len == 0:
+            return []
+
+        if self.strategy == "stop_at_first":
+            # Simple prefix match — accept until first mismatch,
+            # then one correction (the target's argmax)
+            for i in range(chunk_len):
+                if draft_tokens[i] != target_tokens[i]:
+                    return draft_tokens[:i] + [target_tokens[i]]
+            # All matched — return all draft tokens
+            # (no bonus token here; bonus is handled elsewhere
+            # for stop_at_first via the standard rejection path)
+            return list(draft_tokens[:chunk_len])
+
+        # ── Hybrid strategy ───────────────────────────────
+        # LCS alignment to find which positions match
+        matcher = IncrementalLCSMatcher(draft_tokens[:chunk_len])
+        accepted_spans, _ = matcher.add_chunk(target_tokens[:chunk_len])
+
+        # Build match mask
+        matched: set[int] = set()
+        for s, e in accepted_spans:
+            for pos in range(s, e):
+                matched.add(pos)
+
+        # Left-to-right scan with bail-out
+        output: list[int] = []
+        consec_reject = 0
+
+        for pos in range(chunk_len):
+            if pos in matched:
+                # LCS-matched: accept the draft token
+                output.append(draft_tokens[pos])
+                consec_reject = 0
+            else:
+                consec_reject += 1
+                if consec_reject >= self.max_reject:
+                    # Bail out: discard the rejected run,
+                    # keep output up to start of rejected run
+                    # + 1 correction
+                    bail_start = pos - self.max_reject + 1
+                    output = output[:bail_start]
+                    output.append(target_tokens[bail_start])
+                    break
+                # Include correction from target
+                output.append(target_tokens[pos])
+
+        return output
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         """No model to load."""

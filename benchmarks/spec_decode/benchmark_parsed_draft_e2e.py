@@ -534,6 +534,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--parsed-draft-lcs-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "python", "numpy", "triton"],
+        help=(
+            "Backend for LCS draft-cursor advancement. "
+            "'auto' (default): python for small batches, "
+            "numpy for >= 64 requests. "
+            "'triton': GPU Triton kernel."
+        ),
+    )
+    parser.add_argument(
         "--repetition-detection",
         action="store_true",
         default=True,
@@ -693,6 +705,7 @@ def main():
         "num_speculative_tokens": (args.num_speculative_tokens),
         "parsed_draft_strategy": (args.parsed_draft_strategy),
         "parsed_draft_max_reject": (args.parsed_draft_max_reject),
+        "parsed_draft_lcs_backend": (args.parsed_draft_lcs_backend),
     }
 
     print(f"\n{'#' * 60}")

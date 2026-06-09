@@ -3516,9 +3516,11 @@ class GPUModelRunner(
             assert spec_decode_metadata is not None
             assert logits is not None
             target_logits = logits[spec_decode_metadata.target_logits_indices]
+            bonus_logits = logits[spec_decode_metadata.bonus_logits_indices]
             return self.drafter.accept_tokens(
                 spec_decode_metadata,
                 target_logits,
+                bonus_logits,
                 self.input_batch,
             )
 

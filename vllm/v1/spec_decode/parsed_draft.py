@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 from transformers import AutoTokenizer
 
@@ -104,6 +105,169 @@ def _lcs_draft_advance(draft_tokens: list[int], gt_prefix: list[int]) -> int:
             j -= 1
 
     return last_draft_pos + 1
+
+
+def _incremental_lcs_advance(
+    draft_tokens: list[int],
+    gt_tokens: list[int],
+) -> int:
+    """Find draft cursor advance using incremental (row-by-row) DP.
+
+    Same semantics as ``_lcs_draft_advance`` but builds the DP table
+    one GT token at a time (row = GT, column = draft). This layout
+    enables batched vectorization (Phase 2) and GPU execution
+    (Phase 3).
+
+    Each GT token extends a single DP row of length ``M + 1`` at
+    O(M) cost. Total work is still O(M * N), but memory is O(M)
+    for the live row plus O(N * M) for backtrack history (only
+    the current chunk's history, cleared after each call).
+
+    Returns:
+        Number of draft tokens to advance (>= 1).
+    """
+    m_len = len(draft_tokens)
+    n_len = len(gt_tokens)
+    if m_len == 0 or n_len == 0:
+        return 1
+
+    # Row-by-row DP: process one GT token at a time, extending
+    # a single row of length M+1. dp_history[j][i] corresponds
+    # to dp[i][j] in the classic 2D formulation.
+    dp_row = [0] * (m_len + 1)
+    dp_history: list[list[int]] = [list(dp_row)]
+
+    for gt_tok in gt_tokens:
+        prev_row = dp_row
+        dp_row = [0] * (m_len + 1)
+        for i in range(1, m_len + 1):
+            if draft_tokens[i - 1] == gt_tok:
+                dp_row[i] = prev_row[i - 1] + 1
+            else:
+                dp_row[i] = max(dp_row[i - 1], prev_row[i])
+        dp_history.append(list(dp_row))
+
+    # Backtrack to find last matched DRAFT position.
+    # dp_history[j][i] == dp[i][j] in the classic layout.
+    # Original: dp[i-1][j] >= dp[i][j-1] → i -= 1
+    # Transposed: dp_history[j][i-1] >= dp_history[j-1][i] → i -= 1
+    last_draft_pos = 0
+    i, j = m_len, n_len
+    while i > 0 and j > 0:
+        if (
+            draft_tokens[i - 1] == gt_tokens[j - 1]
+            and dp_history[j][i] == dp_history[j - 1][i - 1] + 1
+        ):
+            last_draft_pos = max(last_draft_pos, i - 1)
+            i -= 1
+            j -= 1
+        elif dp_history[j][i - 1] >= dp_history[j - 1][i]:
+            i -= 1
+        else:
+            j -= 1
+
+    return max(last_draft_pos + 1, 1)
+
+
+def _batched_lcs_advance(
+    draft_tokens_list: list[list[int]],
+    gt_tokens_list: list[list[int]],
+) -> list[int]:
+    """Batched LCS draft advance using numpy vectorisation.
+
+    Processes *all* requests in the batch simultaneously: for each
+    column ``i`` of the DP table the update across all B requests
+    is a single numpy vectorised operation.
+
+    Backtracking is still per-request (the path is data-dependent
+    and cheap at O(M + N) per request).
+
+    Args:
+        draft_tokens_list: Per-request draft token lists.
+        gt_tokens_list:    Per-request GT (sampled) token lists.
+
+    Returns:
+        Per-request cursor advance amounts (``len == len(draft_tokens_list)``).
+    """
+    B = len(draft_tokens_list)
+    if B == 0:
+        return []
+
+    max_m = max((len(d) for d in draft_tokens_list), default=0)
+    max_n = max((len(g) for g in gt_tokens_list), default=0)
+    if max_m == 0 or max_n == 0:
+        return [1] * B
+
+    # Pad draft and gt into [B, max_m] / [B, max_n] numpy arrays.
+    # Use -1 as padding (no valid token id is -1).
+    draft_arr = np.full((B, max_m), -1, dtype=np.int64)
+    gt_arr = np.full((B, max_n), -1, dtype=np.int64)
+    draft_lens = np.empty(B, dtype=np.int64)
+    gt_lens = np.empty(B, dtype=np.int64)
+
+    for b in range(B):
+        d = draft_tokens_list[b]
+        g = gt_tokens_list[b]
+        draft_arr[b, : len(d)] = d
+        gt_arr[b, : len(g)] = g
+        draft_lens[b] = len(d)
+        gt_lens[b] = len(g)
+
+    # ── Forward pass: row-by-row DP (one row per GT token) ──
+    #
+    # dp_row[b, i] = LCS(draft_b[0:i], gt_b[0:j]) after processing
+    # j GT tokens.  We store dp_history[j][b, :] for backtracking.
+    dp_row = np.zeros((B, max_m + 1), dtype=np.int32)
+    # dp_history[0] = all-zeros row (before any GT token)
+    dp_history = [dp_row.copy()]
+
+    for j in range(max_n):
+        gt_col = gt_arr[:, j]  # [B]
+        # Which requests still have GT tokens at position j?
+        active = j < gt_lens  # [B] bool
+
+        prev_row = dp_row.copy()  # dp_row *before* this GT token
+        for i in range(1, max_m + 1):
+            valid = active & (i <= draft_lens)
+            matched = valid & (draft_arr[:, i - 1] == gt_col)
+            dp_row[:, i] = np.where(
+                matched,
+                prev_row[:, i - 1] + 1,
+                np.where(
+                    valid,
+                    np.maximum(dp_row[:, i - 1], prev_row[:, i]),
+                    dp_row[:, i],
+                ),
+            )
+        dp_history.append(dp_row.copy())
+
+    # ── Backtrack per request ──
+    advances = []
+    for b in range(B):
+        m = int(draft_lens[b])
+        n = int(gt_lens[b])
+        if m == 0 or n == 0:
+            advances.append(1)
+            continue
+
+        last_draft_pos = 0
+        i, j = m, n
+        while i > 0 and j > 0:
+            if (
+                draft_arr[b, i - 1] == gt_arr[b, j - 1]
+                and dp_history[j][b, i] == dp_history[j - 1][b, i - 1] + 1
+            ):
+                last_draft_pos = max(last_draft_pos, i - 1)
+                i -= 1
+                j -= 1
+            elif dp_history[j][b, i - 1] >= dp_history[j - 1][b, i]:
+                i -= 1
+            else:
+                j -= 1
+
+        advances.append(max(last_draft_pos + 1, 1))
+
+    return advances
 
 
 def _find_draft_skip(draft_tokens: list[int], correction: int, start: int) -> int:
@@ -284,10 +448,16 @@ class ParsedDraftProposer:
         self.chunk_size = spec_config.num_speculative_tokens
         self.strategy = spec_config.parsed_draft_strategy
         self.max_reject = spec_config.parsed_draft_max_reject
+        self.lcs_backend = spec_config.parsed_draft_lcs_backend
         self._providers: dict[str, ParsedDraftProvider] = {}
         # Track which draft tokens were proposed per request so
         # cursor advancement can use LCS alignment on the next call.
         self._last_proposed: dict[str, list[int]] = {}
+
+        # Resolve device for Triton backend
+        self._device: torch.device | None = None
+        if self.lcs_backend == "triton":
+            self._device = torch.device("cuda")
 
         # Load tokenizer for converting draft_text to token ids.
         # The tokenizer is loaded here (in the EngineCore process)
@@ -300,10 +470,12 @@ class ParsedDraftProposer:
         )
         logger.info(
             "ParsedDraftProposer initialized: "
-            "chunk_size=%d, strategy=%s, max_reject=%d",
+            "chunk_size=%d, strategy=%s, max_reject=%d, "
+            "lcs_backend=%s",
             self.chunk_size,
             self.strategy,
             self.max_reject,
+            self.lcs_backend,
         )
 
     def propose(
@@ -324,31 +496,49 @@ class ParsedDraftProposer:
             list[list[int]]: Draft token ids per request. Empty list for
                 requests without draft_text or exhausted drafts.
         """
-        draft_token_ids: list[list[int]] = []
         num_reqs = input_batch.num_reqs
+
+        # ── Pass 1: Collect advance pairs ──
+        # Gather (draft, gt) pairs for all requests that need
+        # cursor advancement, so we can batch the LCS computation.
+        advance_indices: list[int] = []
+        advance_drafts: list[list[int]] = []
+        advance_gts: list[list[int]] = []
+        providers: list[ParsedDraftProvider | None] = []
 
         for i in range(num_reqs):
             req_id = input_batch.req_ids[i]
             sampled = sampled_token_ids[i]
 
             if not sampled:
-                # Partial prefill — skip spec decode.
-                draft_token_ids.append([])
+                providers.append(None)
                 continue
 
             provider = self._get_or_create_provider(req_id, requests)
+            providers.append(provider)
             if provider is None or provider.is_exhausted():
-                draft_token_ids.append([])
                 continue
 
-            # Advance cursor from previous step's verification.
-            # sampled contains the accepted tokens (prefix + bonus).
             last_draft = self._last_proposed.pop(req_id, None)
             if last_draft is not None and sampled:
-                advance = _lcs_draft_advance(last_draft, sampled)
-                provider.advance(max(advance, 1))
+                advance_indices.append(i)
+                advance_drafts.append(last_draft)
+                advance_gts.append(sampled)
 
-            if provider.is_exhausted():
+        # ── Batched LCS advance ──
+        if advance_indices:
+            advances = self._compute_lcs_advances(advance_drafts, advance_gts)
+            for idx, adv in zip(advance_indices, advances):
+                prov = providers[idx]
+                assert prov is not None
+                prov.advance(max(adv, 1))
+
+        # ── Pass 2: Emit draft chunks ──
+        draft_token_ids: list[list[int]] = []
+        for i in range(num_reqs):
+            req_id = input_batch.req_ids[i]
+            provider = providers[i]
+            if provider is None or provider.is_exhausted():
                 draft_token_ids.append([])
                 continue
 
@@ -364,6 +554,33 @@ class ParsedDraftProposer:
                 self._last_proposed.pop(rid, None)
 
         return draft_token_ids
+
+    def _compute_lcs_advances(
+        self,
+        draft_list: list[list[int]],
+        gt_list: list[list[int]],
+    ) -> list[int]:
+        """Dispatch LCS cursor advancement to the configured backend.
+
+        'auto' (default): python for < 64 requests, numpy for >= 64.
+        'python':  per-request incremental DP (Phase 1).
+        'numpy':   batched numpy vectorisation (Phase 2).
+        'triton':  GPU Triton kernel (Phase 3).
+        """
+        backend = self.lcs_backend
+        n = len(draft_list)
+
+        if backend == "triton":
+            from vllm.v1.spec_decode.utils import triton_lcs_advance
+
+            assert self._device is not None
+            return triton_lcs_advance(draft_list, gt_list, self._device)
+
+        if backend == "numpy" or (backend == "auto" and n >= 64):
+            return _batched_lcs_advance(draft_list, gt_list)
+
+        # "python" or "auto" with small batch
+        return [_incremental_lcs_advance(d, g) for d, g in zip(draft_list, gt_list)]
 
     def _get_or_create_provider(
         self,
@@ -431,6 +648,7 @@ class ParsedDraftProposer:
         self,
         metadata: SpecDecodeMetadata,
         target_logits: torch.Tensor,
+        bonus_logits: torch.Tensor,
         input_batch: InputBatch,
     ) -> SamplerOutput:
         """Accept draft tokens using LCS-based hybrid strategy.
@@ -444,6 +662,11 @@ class ParsedDraftProposer:
         4. Bails out after max_reject consecutive rejections
 
         Only supports greedy decoding (temperature=0).
+
+        For requests with 0 draft tokens, the bonus token (target
+        model's argmax at the request's position) is emitted so the
+        request makes progress — matching the standard rejection
+        sampler's behavior.
 
         Returns SamplerOutput with the same shape as the standard
         rejection sampler: sampled_token_ids[batch, max_spec_len+1]
@@ -461,6 +684,9 @@ class ParsedDraftProposer:
         # Compute target argmax for all draft positions
         target_argmax = target_logits.argmax(dim=-1)
 
+        # Compute bonus tokens (one per request)
+        bonus_argmax = bonus_logits.argmax(dim=-1)
+
         # Output buffer: [batch_size, max_spec_len + 1]
         output = torch.full(
             (batch_size, max_spec_len + 1),
@@ -472,6 +698,7 @@ class ParsedDraftProposer:
         # Move to CPU for Python-level LCS + scan
         draft_ids_cpu = draft_token_ids.cpu().tolist()
         target_ids_cpu = target_argmax.cpu().tolist()
+        bonus_ids_cpu = bonus_argmax.cpu().tolist()
         cu_num_cpu = cu_num_draft.cpu().tolist()
 
         output_cpu = output.cpu()
@@ -479,13 +706,23 @@ class ParsedDraftProposer:
             start = cu_num_cpu[req_idx - 1] if req_idx > 0 else 0
             end = cu_num_cpu[req_idx]
             n_draft = end - start
+
             if n_draft == 0:
+                # No draft tokens — emit the bonus token so the
+                # request makes progress (matches standard rejection
+                # sampler behavior).
+                output_cpu[req_idx, 0] = bonus_ids_cpu[req_idx]
                 continue
 
             draft_chunk = draft_ids_cpu[start:end]
             target_chunk = target_ids_cpu[start:end]
 
             accepted = self._hybrid_accept_one(draft_chunk, target_chunk)
+
+            # If all draft tokens matched, append bonus token
+            if len(accepted) == n_draft:
+                accepted.append(bonus_ids_cpu[req_idx])
+
             for i, tok in enumerate(accepted):
                 output_cpu[req_idx, i] = tok
 

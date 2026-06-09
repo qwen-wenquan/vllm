@@ -600,3 +600,193 @@ def unconditional_to_conditional_rates(rates: list[float]) -> list[float]:
     """Convert per-position unconditional rates to per-position conditional
     rates for the early-terminating rejection loop (c_i = p_i / p_{i-1})."""
     return [p / q if q > 0.0 else 0.0 for p, q in zip(rates, [1.0, *rates[:-1]])]
+
+
+# ---------------------------------------------------------------------------
+# LCS draft-advance Triton kernel
+# ---------------------------------------------------------------------------
+# Computes how many draft tokens each request consumes, using an
+# incremental (row-by-row) LCS DP on GPU.  One Triton program per
+# request; the inner loop over draft positions (M ≤ MAX_M) is
+# sequential within a program, which is fine for M ≤ 64.
+
+
+@triton.jit(do_not_specialize=["batch_size"])
+def lcs_advance_kernel(
+    # Inputs
+    draft_tokens_ptr,  # [batch_size, MAX_M]  int32
+    draft_lens_ptr,  # [batch_size]          int32
+    gt_tokens_ptr,  # [total_gt]            int32 (flattened)
+    cu_gt_lens_ptr,  # [batch_size]          int32 (cumsum)
+    # Scratch space: full DP history per request
+    # Layout: [batch_size * (MAX_N+1), MAX_M+1] int32
+    dp_scratch_ptr,
+    # Output
+    advance_out_ptr,  # [batch_size]          int32
+    # Compile-time constants
+    batch_size,
+    MAX_M: tl.constexpr,  # power-of-2 ≥ max draft length
+    MAX_N: tl.constexpr,  # power-of-2 ≥ max GT length
+    STRIDE_ROW: tl.constexpr,  # MAX_M + 1 (rounded to power of 2)
+):
+    """LCS-based draft cursor advance for one request.
+
+    Builds the full DP table row-by-row (one row per GT token)
+    in global memory scratch, then backtracks to find the last
+    matched draft position.
+    """
+    req_idx = tl.program_id(0)
+    if req_idx >= batch_size:
+        return
+
+    draft_len = tl.load(draft_lens_ptr + req_idx)
+    gt_start = tl.load(cu_gt_lens_ptr + req_idx - 1) if req_idx > 0 else 0
+    gt_end = tl.load(cu_gt_lens_ptr + req_idx)
+    gt_len = gt_end - gt_start
+
+    if draft_len == 0 or gt_len == 0:
+        tl.store(advance_out_ptr + req_idx, 1)
+        return
+
+    # Base pointer for this request's DP history.
+    # Layout: rows 0..MAX_N, each of length STRIDE_ROW.
+    # dp_history[j][i] at: dp_base + j * STRIDE_ROW + i
+    dp_base = req_idx * (MAX_N + 1) * STRIDE_ROW
+
+    # Initialize row 0 to zeros
+    for idx in range(MAX_M + 1):
+        if idx <= draft_len:
+            tl.store(dp_scratch_ptr + dp_base + idx, 0)
+
+    # ── Forward pass: fill DP table row by row ──
+    for gt_off in range(MAX_N):
+        if gt_off < gt_len:
+            gt_tok = tl.load(gt_tokens_ptr + gt_start + gt_off)
+            # Current row = gt_off + 1, previous row = gt_off
+            curr_row_base = dp_base + (gt_off + 1) * STRIDE_ROW
+            prev_row_base = dp_base + gt_off * STRIDE_ROW
+
+            # dp[0] = 0 for every row
+            tl.store(dp_scratch_ptr + curr_row_base, 0)
+
+            for pos in range(MAX_M):
+                if pos < draft_len:
+                    draft_tok = tl.load(draft_tokens_ptr + req_idx * MAX_M + pos)
+                    if draft_tok == gt_tok:
+                        # Match: dp_history[j][i] = dp_history[j-1][i-1] + 1
+                        diag = tl.load(dp_scratch_ptr + prev_row_base + pos)
+                        new_val = diag + 1
+                    else:
+                        # No match: max(dp_history[j][i-1], dp_history[j-1][i])
+                        left = tl.load(dp_scratch_ptr + curr_row_base + pos)
+                        up = tl.load(dp_scratch_ptr + prev_row_base + pos + 1)
+                        new_val = tl.maximum(left, up)
+
+                    tl.store(
+                        dp_scratch_ptr + curr_row_base + pos + 1,
+                        new_val,
+                    )
+
+    # ── Backtrack to find last matched draft position ──
+    last_draft_pos = 0
+    i = draft_len
+    j = gt_len
+    for step in range(MAX_M + MAX_N):
+        if i > 0 and j > 0:
+            draft_tok = tl.load(draft_tokens_ptr + req_idx * MAX_M + i - 1)
+            gt_tok = tl.load(gt_tokens_ptr + gt_start + j - 1)
+
+            curr_val = tl.load(dp_scratch_ptr + dp_base + j * STRIDE_ROW + i)
+            diag_val = tl.load(dp_scratch_ptr + dp_base + (j - 1) * STRIDE_ROW + i - 1)
+
+            if draft_tok == gt_tok and curr_val == diag_val + 1:
+                # Match in LCS — record draft position
+                if i - 1 > last_draft_pos:
+                    last_draft_pos = i - 1
+                # Actually we want max, and since i decreases,
+                # the first match IS the maximum
+                i = i - 1
+                j = j - 1
+            else:
+                up_val = tl.load(dp_scratch_ptr + dp_base + j * STRIDE_ROW + i - 1)
+                left_val = tl.load(dp_scratch_ptr + dp_base + (j - 1) * STRIDE_ROW + i)
+                if up_val >= left_val:
+                    i = i - 1
+                else:
+                    j = j - 1
+
+    advance = tl.maximum(last_draft_pos + 1, 1)
+    tl.store(advance_out_ptr + req_idx, advance)
+
+
+def triton_lcs_advance(
+    draft_tokens_list: list[list[int]],
+    gt_tokens_list: list[list[int]],
+    device: torch.device,
+) -> list[int]:
+    """GPU-accelerated batched LCS draft advance via Triton.
+
+    Args:
+        draft_tokens_list: Per-request draft tokens.
+        gt_tokens_list:    Per-request GT (sampled) tokens.
+        device:            CUDA device.
+
+    Returns:
+        Per-request cursor advance amounts.
+    """
+    B = len(draft_tokens_list)
+    if B == 0:
+        return []
+
+    max_m = max((len(d) for d in draft_tokens_list), default=0)
+    max_n = max((len(g) for g in gt_tokens_list), default=0)
+    if max_m == 0 or max_n == 0:
+        return [1] * B
+
+    # Round up to power of 2 for Triton constexpr
+    MAX_M = next_power_of_2(max_m)
+    MAX_N = next_power_of_2(max_n)
+
+    # Build padded tensors
+    draft_tensor = torch.full((B, MAX_M), -1, dtype=torch.int32, device=device)
+    draft_lens = torch.empty(B, dtype=torch.int32, device=device)
+    gt_flat: list[int] = []
+    cu_gt: list[int] = []
+    total = 0
+
+    for b in range(B):
+        d = draft_tokens_list[b]
+        g = gt_tokens_list[b]
+        draft_tensor[b, : len(d)] = torch.tensor(d, dtype=torch.int32)
+        draft_lens[b] = len(d)
+        gt_flat.extend(g)
+        total += len(g)
+        cu_gt.append(total)
+
+    gt_tensor = torch.tensor(gt_flat, dtype=torch.int32, device=device)
+    cu_gt_tensor = torch.tensor(cu_gt, dtype=torch.int32, device=device)
+    advance_out = torch.empty(B, dtype=torch.int32, device=device)
+    # Scratch space for full DP history per request.
+    # Layout: [B * (MAX_N+1), STRIDE_ROW] where STRIDE_ROW is
+    # the next power of 2 >= MAX_M + 1.
+    STRIDE_ROW = next_power_of_2(MAX_M + 1)
+    dp_scratch = torch.zeros(
+        B * (MAX_N + 1) * STRIDE_ROW,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    lcs_advance_kernel[(B,)](
+        draft_tensor,
+        draft_lens,
+        gt_tensor,
+        cu_gt_tensor,
+        dp_scratch,
+        advance_out,
+        batch_size=B,
+        MAX_M=MAX_M,
+        MAX_N=MAX_N,
+        STRIDE_ROW=STRIDE_ROW,
+    )
+
+    return advance_out.cpu().tolist()

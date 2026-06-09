@@ -196,6 +196,14 @@ class SpeculativeConfig:
     """Maximum consecutive rejected tokens before bailing out in hybrid
     strategy. Only used when parsed_draft_strategy='hybrid'."""
 
+    parsed_draft_lcs_backend: str = "auto"
+    """Backend for LCS draft-cursor advancement. 'auto' selects python
+    for small batches and numpy for large batches (>= 64 requests).
+    'python' forces per-request incremental DP. 'numpy' forces batched
+    numpy vectorisation. 'triton' uses a GPU Triton kernel (requires
+    CUDA; eliminates CPU round-trip but has tensor-construction
+    overhead when draft data is not yet GPU-resident)."""
+
     draft_load_config: LoadConfig | None = None
     """Load config for the draft model. If not specified, will use the load
     config from the target model."""
@@ -877,6 +885,16 @@ class SpeculativeConfig:
         if self.parsed_draft_max_reject < 1:
             raise ValueError(
                 f"parsed_draft_max_reject={self.parsed_draft_max_reject} must be >= 1"
+            )
+        if self.parsed_draft_lcs_backend not in (
+            "auto",
+            "python",
+            "numpy",
+            "triton",
+        ):
+            raise ValueError(
+                f"parsed_draft_lcs_backend='{self.parsed_draft_lcs_backend}' "
+                "must be 'auto', 'python', 'numpy', or 'triton'."
             )
 
     @staticmethod

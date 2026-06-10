@@ -914,10 +914,15 @@ class ParsedDraftProposer:
             draft_chunk = draft_ids_cpu[start:end]
             target_chunk = target_ids_cpu[start:end]
 
-            accepted = self._hybrid_accept_one(draft_chunk, target_chunk)
+            accepted, all_matched = self._hybrid_accept_one(draft_chunk, target_chunk)
 
-            # If all draft tokens matched, append bonus token
-            if len(accepted) == n_draft:
+            # Append the bonus token only when every emitted token
+            # was an accepted draft token (no correction was taken).
+            # If a correction was taken at any position, the bonus
+            # logit was computed from a stale context (it assumed
+            # the rejected draft token would be accepted) and would
+            # diverge from the autoregressive output.
+            if all_matched:
                 accepted.append(bonus_ids_cpu[req_idx])
 
             for i, tok in enumerate(accepted):
@@ -934,26 +939,37 @@ class ParsedDraftProposer:
         self,
         draft_tokens: list[int],
         target_tokens: list[int],
-    ) -> list[int]:
+    ) -> tuple[list[int], bool]:
         """Hybrid accept for a single request.
 
         Uses LCS alignment + left-to-right scan with bail-out.
-        Returns the list of accepted/corrected token IDs.
+
+        Returns:
+            ``(accepted_tokens, all_matched)`` where ``all_matched`` is
+            True only when every emitted token is an accepted draft
+            token (no correction was taken anywhere in the chunk).
+            The caller uses this flag to decide whether the bonus
+            token should be appended — appending only when the spec
+            decoder's emitted stream is byte-identical to what the
+            verifier predicted, matching the standard rejection
+            sampler's semantics.
         """
         chunk_len = min(len(draft_tokens), len(target_tokens))
         if chunk_len == 0:
-            return []
+            return [], False
 
         if self.strategy == "stop_at_first":
             # Simple prefix match — accept until first mismatch,
             # then one correction (the target's argmax)
             for i in range(chunk_len):
                 if draft_tokens[i] != target_tokens[i]:
-                    return draft_tokens[:i] + [target_tokens[i]]
-            # All matched — return all draft tokens
-            # (no bonus token here; bonus is handled elsewhere
-            # for stop_at_first via the standard rejection path)
-            return list(draft_tokens[:chunk_len])
+                    # Correction taken at position i; the bonus token
+                    # was computed assuming draft_tokens[i] would be
+                    # accepted, so its context is stale and we must
+                    # NOT emit it.
+                    return draft_tokens[:i] + [target_tokens[i]], False
+            # All matched — caller may append the bonus token.
+            return list(draft_tokens[:chunk_len]), True
 
         # ── Hybrid strategy ───────────────────────────────
         # LCS alignment to find which positions match
@@ -969,6 +985,7 @@ class ParsedDraftProposer:
         # Left-to-right scan with bail-out
         output: list[int] = []
         consec_reject = 0
+        all_matched = True  # flips False the moment we take a correction
 
         for pos in range(chunk_len):
             if pos in matched:
@@ -977,6 +994,7 @@ class ParsedDraftProposer:
                 consec_reject = 0
             else:
                 consec_reject += 1
+                all_matched = False
                 if consec_reject >= self.max_reject:
                     # Bail out: discard the rejected run,
                     # keep output up to start of rejected run
@@ -988,7 +1006,7 @@ class ParsedDraftProposer:
                 # Include correction from target
                 output.append(target_tokens[pos])
 
-        return output
+        return output, all_matched
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         """No model to load."""

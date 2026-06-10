@@ -628,3 +628,108 @@ class TestParsedDraftProposer:
         chunk2 = drafts2[0]
         assert len(chunk2) == 2
         assert chunk2 != chunk1  # different tokens
+
+
+# ---------------------------------------------------------------------------
+# _hybrid_accept_one return-shape tests
+# ---------------------------------------------------------------------------
+
+
+class _MinimalProposer:
+    """Just enough to call _hybrid_accept_one without loading a model."""
+
+    def __init__(self, strategy: str = "stop_at_first", max_reject: int = 3):
+        self.strategy = strategy
+        self.max_reject = max_reject
+
+    _hybrid_accept_one = ParsedDraftProposer._hybrid_accept_one
+
+
+class TestHybridAcceptOneReturnShape:
+    """Regression tests for the bonus-token correctness bug.
+
+    ``_hybrid_accept_one`` must return ``(accepted_tokens, all_matched)``
+    where ``all_matched`` is True only when every emitted token was an
+    accepted draft token (no correction). The caller relies on this to
+    decide whether to append the bonus token — appending after a
+    correction would emit a token whose context (in the verifier's
+    forward pass) assumed the rejected draft token, diverging from AR.
+    """
+
+    def test_stop_at_first_all_matched_returns_true(self):
+        p = _MinimalProposer("stop_at_first")
+        accepted, all_matched = p._hybrid_accept_one([1, 2, 3], [1, 2, 3])
+        assert accepted == [1, 2, 3]
+        assert all_matched is True
+
+    def test_stop_at_first_mismatch_at_start_returns_false(self):
+        p = _MinimalProposer("stop_at_first")
+        accepted, all_matched = p._hybrid_accept_one([1, 2, 3], [99, 88, 77])
+        assert accepted == [99]
+        assert all_matched is False
+
+    def test_stop_at_first_mismatch_at_end_returns_false(self):
+        # The buggy version would have returned True here because
+        # len(accepted) == n_draft, even though position 2 was corrected.
+        p = _MinimalProposer("stop_at_first")
+        accepted, all_matched = p._hybrid_accept_one([1, 2, 3], [1, 2, 99])
+        assert accepted == [1, 2, 99]
+        assert all_matched is False
+
+    def test_stop_at_first_mismatch_at_middle_returns_false(self):
+        p = _MinimalProposer("stop_at_first")
+        accepted, all_matched = p._hybrid_accept_one([1, 2, 3, 4], [1, 99, 3, 4])
+        assert accepted == [1, 99]
+        assert all_matched is False
+
+    def test_stop_at_first_single_token_match_returns_true(self):
+        # n_draft == 1 + all matched → bonus is valid
+        p = _MinimalProposer("stop_at_first")
+        accepted, all_matched = p._hybrid_accept_one([5], [5])
+        assert accepted == [5]
+        assert all_matched is True
+
+    def test_stop_at_first_single_token_mismatch_returns_false(self):
+        # n_draft == 1 + correction → bonus would be wrong (used to fire
+        # the buggy len(accepted) == n_draft branch).
+        p = _MinimalProposer("stop_at_first")
+        accepted, all_matched = p._hybrid_accept_one([5], [99])
+        assert accepted == [99]
+        assert all_matched is False
+
+    def test_stop_at_first_empty_chunk(self):
+        p = _MinimalProposer("stop_at_first")
+        accepted, all_matched = p._hybrid_accept_one([], [])
+        assert accepted == []
+        assert all_matched is False
+
+    def test_hybrid_all_matched_returns_true(self):
+        p = _MinimalProposer("hybrid", max_reject=3)
+        accepted, all_matched = p._hybrid_accept_one([1, 2, 3, 4], [1, 2, 3, 4])
+        assert accepted == [1, 2, 3, 4]
+        assert all_matched is True
+
+    def test_hybrid_with_correction_returns_false(self):
+        # One LCS-mismatch in the middle → correction taken,
+        # all_matched must be False. Bug would have triggered
+        # the bonus-append because len(output) == n_draft.
+        p = _MinimalProposer("hybrid", max_reject=3)
+        # Use distinct tokens: draft[1]=22, target[1]=99 → mismatch at pos 1.
+        # LCS on [10,22,30,40] vs [10,99,30,40] matches positions 0,2,3
+        # (since 22 ≠ 99). At pos 1 we take the correction.
+        accepted, all_matched = p._hybrid_accept_one([10, 22, 30, 40], [10, 99, 30, 40])
+        # Output length still 4, but pos 1 is a correction → not all_matched.
+        assert len(accepted) == 4
+        assert all_matched is False
+
+    def test_hybrid_bailout_returns_false(self):
+        # max_reject=2: two consecutive mismatches trigger bail.
+        # Output is truncated and includes a correction.
+        p = _MinimalProposer("hybrid", max_reject=2)
+        accepted, all_matched = p._hybrid_accept_one(
+            [10, 20, 30, 40, 50],
+            [10, 99, 88, 40, 50],
+        )
+        # Bail at pos 2 (2 consecutive mismatches): output truncated.
+        assert len(accepted) < 5
+        assert all_matched is False

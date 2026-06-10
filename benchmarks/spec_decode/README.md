@@ -172,50 +172,58 @@ kernel-launch bound). For larger verifiers, scale spec-step cost by
 vLLM's LCS implementation produces **identical results** to the EAGLE reference across
 all 9 (strategy × chunk_size) configurations (0 mismatches on 10,000 blocks).
 
-### vLLM E2E Results (H100 NVL, 1000 blocks, sequential)
+### vLLM E2E Results (H100 NVL, lossless after bonus-token fix)
 
-Measured with `benchmark_parsed_draft_e2e.py --sequential --measure-phases` on
-1000 blocks from GTX5k (reparsed with `reparse_ocr_text.py` for clean draft text).
+Measured with `benchmark_parsed_draft_e2e.py` on **500 GTX5k blocks**
+across **10 documents** with `max_num_seqs=8` (continuous batching cap)
+and the Python LCS backend:
 
-#### stop_at_first (chunk=50)
-
-```text
-  Baseline time:    624,432 ms    Spec-decode time: 391,284 ms
-  Baseline tok/s:   108.4         Spec-decode tok/s: 173.6
-  Overall speedup:  1.60x
-
-  Phase breakdown:
-                           Baseline         Spec     Speedup
-  Prefill (ms)               35,356       26,572          —
-  Decode (ms)               569,614      345,508      1.65x
-  Overhead (ms)              19,461       19,204          —
-
-  Decode-only speedup: 1.65x
-  Baseline time split: 6% prefill, 91% decode, 3% overhead
+```bash
+.venv/bin/python benchmarks/spec_decode/benchmark_parsed_draft_e2e.py \
+    --max-docs 10 --max-blocks 500 \
+    --max-num-seqs 8 \
+    --parsed-draft-lcs-backend python \
+    --no-parsed-draft-holdsnap
 ```
 
-#### hybrid (mr=3, chunk=50, 20 blocks)
+#### stop_at_first (chunk=16, default; max_num_seqs=8)
 
 ```text
-  Baseline time:    13,267 ms     Spec-decode time: 1,704 ms
-  Overall speedup:  7.79x
-
-  Phase breakdown:
-                           Baseline         Spec     Speedup
-  Prefill (ms)                  880          650          —
-  Decode (ms)                12,035          677     17.78x
-  Overhead (ms)                 352          377          —
-
-  Decode-only speedup: 17.78x
+  Blocks:           500
+  Exact match:      499/500 (99.8%)
+  Mean edit dist:   0.0 chars
+  Baseline time:    41,935 ms     Spec-decode time: 28,696 ms
+  Baseline tok/s:   660.8         Spec-decode tok/s: 965.6
+  Speedup:          1.46x
 ```
+
+The single non-exact block (1/500) almost certainly differs by 1–2
+tokens at the repetition-detection termination boundary; mean edit
+distance is 0.0 chars (it rounds to zero).
+
+#### Why earlier "Decode-only 17.78x" numbers were misleading
+
+Two prior e2e measurements in earlier revisions of this README
+quoted speedups of 1.60x and 7.79x (with a "Decode-only 17.78x"
+breakdown). Those runs were taken **before the bonus-token
+correctness fix in `accept_tokens()`** that emitted a stale bonus
+token after any chunk-tail correction, polluting output. With the
+fix:
+
+- Output is **lossless against AR baseline** (99.8% exact match).
+- Per-block throughput improves modestly: ~1.46x at chunk=16 with
+  continuous batching.
+
+For larger models (7B+) where verify cost scales with sequence
+length, both numbers will move — verify-per-token cost drops
+faster than decode-per-token cost, so speedup grows.
 
 #### Analysis
 
-The 0.3B PaddleOCR-VL model has nearly identical cost for verifying 50 tokens
-vs decoding 1 token (~10ms vs ~11ms) because the GPU is underutilized at this
-model size. This limits stop_at_first's effective speedup. The hybrid strategy
-overcomes this by accepting ~2.5 tokens/step instead of ~1.4 (full-10k
-simulator), dramatically reducing the number of verify rounds.
-
-For larger models (7B+) where verify cost scales with sequence length, both
-strategies will show proportionally larger speedups.
+The 0.3B PaddleOCR-VL model has nearly identical cost for verifying
+16 tokens vs decoding 1 token (~10ms vs ~11ms) because the GPU is
+underutilized at this model size. This limits the achievable
+speedup with any prefix-match-only strategy. The simulator suggests
+the hybrid strategy can reach 1.91x at this chunk size by accepting
+non-prefix matches within a chunk; that measurement has not yet
+been validated end-to-end after the bonus-token fix.

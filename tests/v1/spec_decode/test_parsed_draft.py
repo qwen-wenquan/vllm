@@ -9,6 +9,8 @@ from vllm.v1.spec_decode.parsed_draft import (
     _find_draft_skip,
     _lcs_draft_advance,
     find_prefix_match,
+    holdsnap_advance,
+    normalize_parsed_text,
 )
 
 # ---------------------------------------------------------------------------
@@ -215,6 +217,202 @@ class TestFindDraftSkip:
 
 
 # ---------------------------------------------------------------------------
+# holdsnap_advance tests
+# ---------------------------------------------------------------------------
+
+
+class TestHoldsnapAdvance:
+    def test_prefix_match_uses_lcs_advance(self):
+        # When sampled[0] == last_draft[0] we're in the prefix-match
+        # branch — defer to the LCS advance value (with floor 1).
+        adv, holds = holdsnap_advance(
+            last_draft=[1, 2, 3, 4],
+            sampled=[1, 2, 99],
+            lcs_advance=3,
+            consecutive_holds=2,
+            max_hold=8,
+        )
+        assert adv == 3
+        assert holds == 0  # always reset on prefix match
+
+    def test_prefix_match_with_zero_lcs_advance_floors_to_one(self):
+        # Defensive: lcs_advance=0 in the prefix-match branch is
+        # nonsensical (we know position 0 matches), but the function
+        # should still produce a forward advance.
+        adv, holds = holdsnap_advance(
+            last_draft=[1, 2, 3],
+            sampled=[1, 99],
+            lcs_advance=0,
+            consecutive_holds=0,
+            max_hold=8,
+        )
+        assert adv == 1
+        assert holds == 0
+
+    def test_snap_to_correction_position(self):
+        # Correction (sampled[0]=5) appears at draft position 2 →
+        # advance by 2 so the next chunk starts with token 5.
+        adv, holds = holdsnap_advance(
+            last_draft=[11, 12, 5, 6],
+            sampled=[5, 6],
+            lcs_advance=99,  # ignored when snap fires
+            consecutive_holds=4,  # any value, gets reset
+            max_hold=8,
+        )
+        assert adv == 2
+        assert holds == 0  # snap resets the counter
+
+    def test_snap_to_first_position_correction(self):
+        # Correction is at draft[1] → advance by 1 (not 0).
+        # This matters because advance=0 would mean "hold" which
+        # has different semantics.
+        adv, holds = holdsnap_advance(
+            last_draft=[11, 5, 6],
+            sampled=[5],
+            lcs_advance=99,
+            consecutive_holds=0,
+            max_hold=8,
+        )
+        assert adv == 1
+        assert holds == 0
+
+    def test_hold_when_correction_absent(self):
+        # Correction (99) not in [11, 12, 5, 6] → hold (advance 0).
+        adv, holds = holdsnap_advance(
+            last_draft=[11, 12, 5, 6],
+            sampled=[99],
+            lcs_advance=1,  # ignored
+            consecutive_holds=0,
+            max_hold=8,
+        )
+        assert adv == 0
+        assert holds == 1  # incremented
+
+    def test_hold_increments_counter(self):
+        # Multiple holds in a row should keep incrementing.
+        adv, holds = holdsnap_advance(
+            last_draft=[1, 2, 3],
+            sampled=[99],
+            lcs_advance=1,
+            consecutive_holds=5,
+            max_hold=8,
+        )
+        assert adv == 0
+        assert holds == 6
+
+    def test_forced_advance_at_max_hold(self):
+        # When consecutive_holds reaches max_hold, force a 1-step
+        # advance to avoid stalling.
+        adv, holds = holdsnap_advance(
+            last_draft=[1, 2, 3],
+            sampled=[99],
+            lcs_advance=1,
+            consecutive_holds=8,
+            max_hold=8,
+        )
+        assert adv == 1
+        assert holds == 0  # reset after forced advance
+
+    def test_forced_advance_at_max_hold_exceeded(self):
+        # Defensive: state can exceed max_hold (e.g. max_hold lowered
+        # mid-flight). Still trigger forced advance.
+        adv, holds = holdsnap_advance(
+            last_draft=[1, 2, 3],
+            sampled=[99],
+            lcs_advance=1,
+            consecutive_holds=20,
+            max_hold=8,
+        )
+        assert adv == 1
+        assert holds == 0
+
+    def test_empty_sampled_defensive(self):
+        # Caller should filter empty sampled, but if we land here
+        # produce a forward advance using the LCS hint.
+        adv, holds = holdsnap_advance(
+            last_draft=[1, 2, 3],
+            sampled=[],
+            lcs_advance=2,
+            consecutive_holds=3,
+            max_hold=8,
+        )
+        assert adv == 2
+        assert holds == 0
+
+    def test_empty_draft_defensive(self):
+        adv, holds = holdsnap_advance(
+            last_draft=[],
+            sampled=[1],
+            lcs_advance=5,
+            consecutive_holds=3,
+            max_hold=8,
+        )
+        assert adv == 5
+        assert holds == 0
+
+
+# ---------------------------------------------------------------------------
+# normalize_parsed_text tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeParsedText:
+    def test_ligature_decomposition(self):
+        # NFKC decomposes ﬁ (U+FB01) to "fi", ﬂ (U+FB02) to "fl".
+        assert normalize_parsed_text("ofﬁce") == "office"
+        assert normalize_parsed_text("inﬂation") == "inflation"
+        assert normalize_parsed_text("ﬀ ﬁ ﬂ ﬃ ﬄ") == "ff fi fl ffi ffl"
+
+    def test_newline_to_space(self):
+        # PyMuPDF emits \n at every visual line boundary even within
+        # a paragraph; these get joined with spaces.
+        assert normalize_parsed_text("a\nb\nc") == "a b c"
+        # Empty lines are dropped.
+        assert normalize_parsed_text("a\n\n\nb") == "a b"
+        # Trailing whitespace on each line is stripped first.
+        assert normalize_parsed_text("a  \n  b") == "a b"
+
+    def test_residual_hyphen_collapse(self):
+        # PyMuPDF leaves compound-word hyphens with a space after the
+        # dash; we want to glue them back together.
+        assert normalize_parsed_text("MALE- IDENTIFIED") == "MALE-IDENTIFIED"
+        # Only triggers between word chars on both sides — does NOT
+        # collapse "foo - bar" (free-standing dash, e.g. a list item).
+        assert normalize_parsed_text("foo - bar") == "foo - bar"
+
+    def test_multi_space_collapse(self):
+        assert normalize_parsed_text("a   b    c") == "a b c"
+        assert (
+            normalize_parsed_text("  leading   middle  trailing  ")
+            == "leading middle trailing"
+        )
+
+    def test_nfc_accent_composition(self):
+        # NFKC also composes — combining accent + letter form the
+        # single accented char.
+        decomposed = "café"  # café with combining acute
+        composed = "café"
+        assert normalize_parsed_text(decomposed) == composed
+
+    def test_idempotent(self):
+        # Calling twice gives the same result as calling once.
+        s = "ofﬁce  with-- MALE- IDENTIFIED  text"
+        once = normalize_parsed_text(s)
+        twice = normalize_parsed_text(once)
+        assert once == twice
+
+    def test_empty_and_whitespace(self):
+        assert normalize_parsed_text("") == ""
+        assert normalize_parsed_text("   ") == ""
+
+    def test_no_change_on_clean_text(self):
+        # ASCII text with single spaces and no ligatures should pass
+        # through unchanged.
+        clean = "The quick brown fox jumps over the lazy dog."
+        assert normalize_parsed_text(clean) == clean
+
+
+# ---------------------------------------------------------------------------
 # ParsedDraftProvider tests
 # ---------------------------------------------------------------------------
 
@@ -267,6 +465,44 @@ class TestParsedDraftProvider:
         provider = ParsedDraftProvider("", MockTokenizer())
         assert provider.is_exhausted()
         assert provider.get_next_chunk(5) == []
+
+    def test_normalize_via_draft_text(self):
+        # draft_text path: normalize=True (default) should NFKC the
+        # input before tokenizing, so a ligature in the input becomes
+        # the ASCII pair after tokenization.
+        tok = MockTokenizer()
+        with_norm = ParsedDraftProvider(draft_text="oﬃce  hi", tokenizer=tok)
+        # "ofﬁce  hi" → "ofﬁce hi" (NFKC turns ﬃ into ffi, then
+        # double-space collapses): "office hi" → 9 chars (= 9 tokens
+        # for MockTokenizer).
+        assert with_norm.draft_ids == [ord(c) for c in "office hi"]
+
+        without_norm = ParsedDraftProvider(
+            draft_text="oﬃce  hi", tokenizer=tok, normalize=False
+        )
+        # No normalization: raw 7-char string → 7 tokens.
+        assert without_norm.draft_ids == [ord(c) for c in "oﬃce  hi"]
+
+    def test_normalize_does_not_apply_to_draft_ids_path(self):
+        # When IDs are supplied directly, ``normalize`` has no effect —
+        # the caller is responsible for normalization upstream.
+        ids = [1, 2, 3]
+        p_default = ParsedDraftProvider(draft_ids=ids)
+        p_no_norm = ParsedDraftProvider(draft_ids=ids, normalize=False)
+        assert p_default.draft_ids == ids
+        assert p_no_norm.draft_ids == ids
+
+    def test_consecutive_holds_starts_at_zero(self):
+        # Providers begin with no held steps.
+        p = ParsedDraftProvider(draft_ids=[1, 2, 3])
+        assert p.consecutive_holds == 0
+
+    def test_consecutive_holds_state_is_writable(self):
+        # The proposer mutates this directly after each holdsnap_advance
+        # call; verify the field is in fact writable.
+        p = ParsedDraftProvider(draft_ids=[1, 2, 3])
+        p.consecutive_holds = 5
+        assert p.consecutive_holds == 5
 
 
 # ---------------------------------------------------------------------------

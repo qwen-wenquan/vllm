@@ -504,7 +504,7 @@ def main():
     )
     parser.add_argument(
         "--samples-dir",
-        default=("/home/dlisuser/EAGLE/models/samples/GTX5k"),
+        default=("data/GTX5k"),
     )
     parser.add_argument("--max-docs", type=int, default=1)
     parser.add_argument("--max-blocks", type=int, default=50)
@@ -515,8 +515,8 @@ def main():
     parser.add_argument(
         "--num-speculative-tokens",
         type=int,
-        default=50,
-        help="Draft chunk size in tokens (default: 50)",
+        default=16,
+        help="Draft chunk size in tokens (default: 16)",
     )
     parser.add_argument(
         "--parsed-draft-strategy",
@@ -534,15 +534,46 @@ def main():
         ),
     )
     parser.add_argument(
+        "--parsed-draft-holdsnap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable holdsnap cursor rule for no-prefix-match case "
+            "(SNAP cursor to correction if found in chunk, otherwise "
+            "HOLD up to --parsed-draft-max-hold consecutive steps). "
+            "Lossless. Default OFF — matches the production default. "
+            "Holdsnap is a simulator-tuned rule that doesn't translate "
+            "to real verifiers (the simulator's gt-stream verifier "
+            "slides forward independently of the draft; the real "
+            "verifier re-rejects the same draft on a hold). See "
+            "benchmarks/spec_decode/SIMULATION_RESULTS.md for the "
+            "1.49x → 1.03x regression measured on GTX5k."
+        ),
+    )
+    parser.add_argument(
+        "--parsed-draft-max-hold",
+        type=int,
+        default=8,
+        help=(
+            "Maximum consecutive holds before forcing a 1-step cursor "
+            "advance when holdsnap is enabled. Matches the benchmark "
+            "sweep optimum at chunk_size=16 (default: 8). Larger values "
+            "are safe on OCR data."
+        ),
+    )
+    parser.add_argument(
         "--parsed-draft-lcs-backend",
         type=str,
         default="auto",
-        choices=["auto", "python", "numpy", "triton"],
+        choices=["auto", "python", "numpy", "triton", "positional"],
         help=(
             "Backend for LCS draft-cursor advancement. "
             "'auto' (default): python for small batches, "
             "numpy for >= 64 requests. "
-            "'triton': GPU Triton kernel."
+            "'triton': GPU Triton kernel. "
+            "'positional': DISABLES LCS — cursor advances by "
+            "prefix_len+1 (no insertion/deletion recovery). "
+            "Use only to A/B the value of LCS alignment."
         ),
     )
     parser.add_argument(
@@ -705,6 +736,8 @@ def main():
         "num_speculative_tokens": (args.num_speculative_tokens),
         "parsed_draft_strategy": (args.parsed_draft_strategy),
         "parsed_draft_max_reject": (args.parsed_draft_max_reject),
+        "parsed_draft_holdsnap": (args.parsed_draft_holdsnap),
+        "parsed_draft_max_hold": (args.parsed_draft_max_hold),
         "parsed_draft_lcs_backend": (args.parsed_draft_lcs_backend),
     }
 
@@ -756,7 +789,10 @@ def main():
         (
             f"PARSED-DRAFT SPEC DECODE "
             f"(strategy={args.parsed_draft_strategy}, "
-            f"chunk={args.num_speculative_tokens})"
+            f"chunk={args.num_speculative_tokens}, "
+            f"holdsnap={'on' if args.parsed_draft_holdsnap else 'off'}"
+            + (f"/h={args.parsed_draft_max_hold}" if args.parsed_draft_holdsnap else "")
+            + ")"
         ),
         sequential=args.sequential,
     )

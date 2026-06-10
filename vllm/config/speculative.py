@@ -196,13 +196,42 @@ class SpeculativeConfig:
     """Maximum consecutive rejected tokens before bailing out in hybrid
     strategy. Only used when parsed_draft_strategy='hybrid'."""
 
+    parsed_draft_holdsnap: bool = False
+    """Enable the holdsnap cursor-advance rule for the no-prefix-match
+    case. Lossless. Designed to absorb gt-side insertions by holding
+    the cursor when the verifier's correction is not in the draft chunk.
+
+    **Disabled by default — does not improve end-to-end speedup in
+    production.** The simulator (``benchmark_parsed_draft.py``) measured
+    a +17% speedup at chunk=16 (1.35x → 1.58x), but the e2e benchmark on
+    GTX5k measured a regression (1.49x → 1.03x). The simulator's
+    "verifier" is the gt token stream and slides forward each step
+    regardless of input; the real verifier is deterministic on context,
+    so re-feeding the same draft after a HOLD produces the same
+    rejection — forever-hold until ``parsed_draft_max_hold`` forces an
+    advance, wasting verifier work the whole time. Kept as a code
+    artifact for further research; off by default. See
+    ``benchmarks/spec_decode/SIMULATION_RESULTS.md`` for the full
+    explanation."""
+
+    parsed_draft_max_hold: int = 8
+    """Maximum consecutive holds before forcing a cursor advance when
+    holdsnap is enabled. Only relevant when
+    ``parsed_draft_holdsnap=True``. Picks 8 to match the chunk_size=16
+    / max_hold=8 benchmark sweep optimum."""
+
     parsed_draft_lcs_backend: str = "auto"
     """Backend for LCS draft-cursor advancement. 'auto' selects python
     for small batches and numpy for large batches (>= 64 requests).
     'python' forces per-request incremental DP. 'numpy' forces batched
     numpy vectorisation. 'triton' uses a GPU Triton kernel (requires
     CUDA; eliminates CPU round-trip but has tensor-construction
-    overhead when draft data is not yet GPU-resident)."""
+    overhead when draft data is not yet GPU-resident).
+    'positional' DISABLES LCS — the cursor advances by exactly the
+    number of accepted/sampled GT tokens (i.e. prefix_len + 1 for
+    stop_at_first, bail_pos for hybrid). Use only for ablation: any
+    OCR insertion/deletion will permanently desync the draft cursor
+    from the verifier's output, collapsing accept rate."""
 
     draft_load_config: LoadConfig | None = None
     """Load config for the draft model. If not specified, will use the load
@@ -891,10 +920,11 @@ class SpeculativeConfig:
             "python",
             "numpy",
             "triton",
+            "positional",
         ):
             raise ValueError(
                 f"parsed_draft_lcs_backend='{self.parsed_draft_lcs_backend}' "
-                "must be 'auto', 'python', 'numpy', or 'triton'."
+                "must be 'auto', 'python', 'numpy', 'triton', or 'positional'."
             )
 
     @staticmethod

@@ -11,9 +11,11 @@ See [INSTALL.md](INSTALL.md) for full environment setup instructions.
 
 Verifies that vLLM's LCS utilities produce **identical results** to the EAGLE reference
 implementation. Runs both implementations side-by-side on the same pre-tokenized OCR
-blocks and compares accepted tokens, verify steps, and speedup estimates.
+blocks and compares accepted tokens, spec steps, AR fallback steps, and end-to-end
+speedup.
 
-No GPU required.
+No GPU required. See [SIMULATION_RESULTS.md](SIMULATION_RESULTS.md) for the latest
+simulator results and methodology.
 
 ```bash
 # Run with default settings (100 blocks, chunk sizes 16/50/200)
@@ -118,7 +120,8 @@ The fidelity benchmark uses pre-tokenized JSON from
 
 ## Results Summary
 
-Results from 100 blocks on H100 NVL (PaddleOCR-VL 0.3B):
+Results from the **full 10,000-block** simulator on H100 NVL
+(PaddleOCR-VL 0.3B):
 
 ### Measured Latency
 
@@ -136,36 +139,38 @@ For this small model, verify cost is ~1.1x a single decode step regardless of ch
 size — the forward pass is dominated by kernel launch overhead, not FLOPS. Larger
 models would show more separation between decode and verify cost.
 
-### Estimated Speedup
+### Estimated Speedup (from simulator, 10,000 blocks)
 
-Using decode=10.2 ms/step, verify=11.2 ms/step (measured on H100 NVL):
+End-to-end speedup vs pure-AR baseline as
+`n_gt / (spec_steps + ar_fallback_steps)`. See
+[SIMULATION_RESULTS.md](SIMULATION_RESULTS.md) for full methodology
+and caveats.
 
-| Strategy | Chunk Size | Verify Steps | Verify Time | AR Time | **Speedup** |
-| --- | --- | --- | --- | --- | --- |
-| stop_at_first | 16 | 2,444 | 27.4s | 64.5s | **2.4x** |
-| stop_at_first | 50 | 1,729 | 19.4s | 64.5s | **3.3x** |
-| stop_at_first | 200 | 1,440 | 16.1s | 64.5s | **4.0x** |
-| hybrid (mr=3) | 16 | 1,051 | 11.8s | 64.5s | **5.5x** |
-| hybrid (mr=3) | 50 | 955 | 10.7s | 64.5s | **6.0x** |
-| hybrid (mr=3) | 200 | 966 | 10.8s | 64.5s | **6.0x** |
+| Strategy | Chunk Size | Accept Rate | tok/spec step | Spec Steps | AR Fallback | Forward Passes | **Speedup** |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| stop_at_first | 16 | 26.2% | 1.45 | 412,687 | 126,649 | 539,336 | 1.35× |
+| hybrid (mr=3) | 16 | 33.7% | 2.19 | 291,656 | 89,123 | 380,779 | **1.91×** |
+| holdsnap (h=8) | 16 | 37.4% | 1.60 | 445,958 | 13,747 | 459,705 | 1.58× |
+| stop_at_first | 50 | 16.2% | 1.44 | 261,660 | 350,211 | 611,871 | 1.19× |
+| hybrid (mr=3) | 50 | 28.2% | 2.46 | 191,187 | 255,899 | 447,086 | **1.63×** |
+| holdsnap (h=8) | 50 | 19.3% | 1.35 | 391,446 | 198,882 | 590,328 | 1.23× |
+| stop_at_first | 200 | 11.6% | 1.44 | 184,932 | 459,709 | 644,641 | 1.13× |
+| hybrid (mr=3) | 200 | 21.4% | 2.50 | 137,751 | 382,755 | 520,506 | **1.40×** |
+| holdsnap (h=8) | 200 | 13.6% | 1.30 | 323,459 | 307,709 | 631,168 | 1.15× |
 
-AR time = 6,322 tokens x 10.2 ms. Verify time = steps x 11.2 ms.
+`n_gt = 726,871` total ground-truth tokens across all 10,000 blocks.
+**hybrid (mr=3) at chunk_size=16 is the production-recommended config:
+1.91× end-to-end speedup (41% fewer forward passes than pure AR).**
 
-### Acceptance Rate Simulation
-
-| Strategy | Chunk Size | Accept Rate | Verify Steps | Avg tok/step |
-| --- | --- | --- | --- | --- |
-| stop_at_first | 16 | 47.4% | 2,444 | 2.2 |
-| stop_at_first | 50 | 30.4% | 1,729 | 2.1 |
-| stop_at_first | 200 | 20.4% | 1,440 | 1.9 |
-| hybrid (mr=3) | 16 | 60.3% | 1,051 | 5.6 |
-| hybrid (mr=3) | 50 | 47.5% | 955 | 4.9 |
-| hybrid (mr=3) | 200 | 42.5% | 966 | 4.4 |
+These assume verify and decode cost are equal, which holds for the 0.3B
+PaddleOCR-VL model on H100 NVL (~10.2 ms decode, ~11.2 ms verify,
+kernel-launch bound). For larger verifiers, scale spec-step cost by
+`verify_ms / decode_ms`.
 
 ### Fidelity Check
 
 vLLM's LCS implementation produces **identical results** to the EAGLE reference across
-all 6 configurations (0 mismatches on 100 blocks).
+all 9 (strategy × chunk_size) configurations (0 mismatches on 10,000 blocks).
 
 ### vLLM E2E Results (H100 NVL, 1000 blocks, sequential)
 
@@ -209,8 +214,8 @@ Measured with `benchmark_parsed_draft_e2e.py --sequential --measure-phases` on
 The 0.3B PaddleOCR-VL model has nearly identical cost for verifying 50 tokens
 vs decoding 1 token (~10ms vs ~11ms) because the GPU is underutilized at this
 model size. This limits stop_at_first's effective speedup. The hybrid strategy
-overcomes this by accepting ~4.9 tokens/step instead of ~2.1, dramatically
-reducing the number of verify rounds.
+overcomes this by accepting ~2.5 tokens/step instead of ~1.4 (full-10k
+simulator), dramatically reducing the number of verify rounds.
 
 For larger models (7B+) where verify cost scales with sequence length, both
 strategies will show proportionally larger speedups.

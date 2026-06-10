@@ -13,9 +13,11 @@ Phase 1: stop_at_first strategy (greedy-exact, identical to AR output).
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Any
 
 import numpy as np
+import regex as re
 import torch
 from transformers import AutoTokenizer
 
@@ -26,6 +28,76 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Text normalization for parsed draft input
+# ---------------------------------------------------------------------------
+
+# Pre-compile once at module load.
+#
+# - ``_RESIDUAL_HYPHEN_RE``: fixes compound-word hyphens that survived
+#   PyMuPDF's TEXT_DEHYPHENATE — patterns like ``"MALE- IDENTIFIED"``
+#   (a line-broken compound) collapse to ``"MALE-IDENTIFIED"``.
+# - ``_MULTI_SPACE_RE``: collapses runs of 2+ spaces to a single space.
+_RESIDUAL_HYPHEN_RE = re.compile(r"(\w)- (\w)")
+_MULTI_SPACE_RE = re.compile(r" {2,}")
+
+
+def normalize_parsed_text(text: str) -> str:
+    """Normalize parsed-draft text to maximize token-level alignment
+    with target model output.
+
+    Applies four idempotent, content-preserving transformations that
+    remove sources of token-level disagreement that don't affect
+    meaning:
+
+    1. **Visual line breaks → spaces.** PyMuPDF emits ``\\n`` at every
+       visual line boundary, even within a paragraph. These are
+       layout artifacts, not semantic breaks. Lines are stripped and
+       joined with a single space.
+    2. **NFKC unicode normalization.** Decomposes compatibility
+       characters — most importantly ligatures like ``ﬁ`` → ``fi``
+       and ``ﬂ`` → ``fl`` (common in academic PDFs but rare in
+       VL-model output). Also composes accented characters to their
+       canonical form.
+    3. **Residual hyphen fix.** PyMuPDF's ``TEXT_DEHYPHENATE`` flag
+       handles word-level line-break hyphens (``pho-\\ntonic`` →
+       ``photonic``) but misses compound-word hyphens. After joining
+       lines with spaces, those appear as ``"MALE- IDENTIFIED"``;
+       this collapses them to ``"MALE-IDENTIFIED"``.
+    4. **Whitespace collapse.** Runs of multiple spaces collapse to
+       a single space, and leading/trailing whitespace is stripped.
+
+    These mirror the rules in
+    ``benchmarks/spec_decode/pymupdf_utils.py::_clean_paragraph_text``,
+    applied so the draft matches what the target VL model naturally
+    emits from the same image crop.
+
+    Measured impact (full 10,000-block OCR sample,
+    ``sft_ocr_blocks_10k.tokenized.json``, hybrid_mr=3 strategy):
+
+    +---------------+---------------+----------------+---------+
+    | chunk_size    | baseline      | normalized     | gain    |
+    +===============+===============+================+=========+
+    | 16            | 3.54×         | 3.93×          | +14 %   |
+    | 50            | 3.01×         | 3.76×          | +25 %   |
+    | 200           | 2.24×         | 3.28×          | +46 %   |
+    +---------------+---------------+----------------+---------+
+
+    The function is safe to call on already-normalized text — repeated
+    application is a no-op after the first call.
+    """
+    # 1. Visual line breaks → spaces.
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    text = " ".join(lines)
+    # 2. NFKC unicode normalization (ligatures, compatibility forms).
+    text = unicodedata.normalize("NFKC", text)
+    # 3. Residual hyphen fix.
+    text = _RESIDUAL_HYPHEN_RE.sub(r"\1-\2", text)
+    # 4. Whitespace collapse.
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +357,92 @@ def _find_draft_skip(draft_tokens: list[int], correction: int, start: int) -> in
     return 1
 
 
+def holdsnap_advance(
+    last_draft: list[int],
+    sampled: list[int],
+    lcs_advance: int,
+    consecutive_holds: int,
+    max_hold: int,
+) -> tuple[int, int]:
+    """Hold+snap cursor-advance rule (simulator-tuned; OFF by default
+    in production — see "Production caveat" below).
+
+    Used in the no-prefix-match branch when ``sampled[0] != last_draft[0]``
+    (the verifier rejected the very first draft token). In that case the
+    LCS-based advance ``_lcs_draft_advance(last_draft, sampled)`` would
+    blindly advance the cursor by ``max(adv, 1)``, consuming a draft
+    token that may match a gt token a few positions later. The
+    hold+snap rule looks at ``sampled[0]`` (the correction emitted by
+    the verifier) and:
+
+    - **SNAP**: if ``sampled[0]`` appears at position ``i`` in
+      ``last_draft``, advance by exactly ``i`` so the next chunk starts
+      with that token. The verifier can then confirm it as a real
+      prefix match.
+    - **HOLD**: if ``sampled[0]`` is not in ``last_draft``, advance by 0
+      (keep cursor parked) and re-verify the same draft chunk against
+      the shifted gt window on the next step. Bounded by ``max_hold``
+      consecutive holds — once exceeded, fall back to advancing by 1
+      to avoid stalling.
+
+    Lossless: changing only the cursor never changes which tokens the
+    verifier accepts — the spec decoder's output remains byte-identical
+    to autoregressive decoding.
+
+    **Production caveat — why this is off by default.** The simulator
+    (``benchmarks/spec_decode/benchmark_parsed_draft.py``) measured
+    +17 % speedup at chunk=16 with this rule, but the e2e GTX5k
+    benchmark measured a regression (1.49× → 1.03×). The two diverge
+    because the simulator's "verifier" is the gt token stream, which
+    slides forward independently of what the simulator feeds it. The
+    real verifier is a deterministic forward pass over the prompt +
+    accepted-so-far + draft chunk: re-feeding the same chunk after a
+    HOLD produces the same rejection, so the cursor stays parked until
+    ``max_hold`` forces an advance — wasting an entire verifier pass
+    per held step. ``holdsnap_advance`` is kept for research; the
+    fix is a verifier-aware cursor rule, not this one.
+
+    Args:
+        last_draft: Tokens of the draft chunk proposed last step.
+        sampled: Verifier-accepted/corrected tokens from this step
+            (must be non-empty; caller filters empty case).
+        lcs_advance: Result of the LCS-based advance computation,
+            used as the fallback if neither snap nor hold apply.
+        consecutive_holds: Number of consecutive holds applied to
+            this request's cursor so far.
+        max_hold: Maximum consecutive holds before forcing an advance
+            (typically equal to chunk_size, default 8 in benchmarks).
+
+    Returns:
+        ``(advance, new_consecutive_holds)`` — the cursor advance to
+        apply (always ≥ 0; 0 means "hold") and the updated hold
+        counter (0 on snap or prefix match, +1 on hold, 0 after
+        forced advance).
+    """
+    if not sampled or not last_draft:
+        # Defensive: caller should filter, but if we land here just
+        # use the LCS advance with the standard floor of 1.
+        return max(lcs_advance, 1), 0
+
+    if sampled[0] == last_draft[0]:
+        # Prefix-match case — the LCS advance is the right answer.
+        return max(lcs_advance, 1), 0
+
+    # No prefix match. Look for the correction in the rest of the
+    # draft chunk.
+    correction = sampled[0]
+    for i, tok in enumerate(last_draft):
+        if tok == correction:
+            # SNAP: advance to the correction position so the next
+            # chunk starts with it.
+            return i, 0
+
+    # Correction not in draft — HOLD, unless we've hit the cap.
+    if consecutive_holds >= max_hold:
+        return 1, 0
+    return 0, consecutive_holds + 1
+
+
 class IncrementalLCSMatcher:
     """Incremental LCS-based matcher for speculative decoding.
 
@@ -386,6 +544,13 @@ class ParsedDraftProvider:
     Accepts either pre-tokenized IDs (preferred — avoids
     tokenizer overhead in the engine loop) or raw text
     (tokenized once on construction).
+
+    Text-input path: ``normalize=True`` (default) runs
+    ``normalize_parsed_text`` on the input before tokenizing.
+    This typically improves end-to-end speedup by 14-46% on OCR
+    workloads (see the helper's docstring for measurements).
+    For the pre-tokenized path callers must apply normalization
+    themselves before tokenizing — the IDs are taken as given.
     """
 
     def __init__(
@@ -393,10 +558,13 @@ class ParsedDraftProvider:
         draft_ids: list[int] | None = None,
         draft_text: str | None = None,
         tokenizer: Any = None,
+        normalize: bool = True,
     ):
         if draft_ids is not None:
             self.draft_ids = draft_ids
         elif draft_text is not None and tokenizer is not None:
+            if normalize:
+                draft_text = normalize_parsed_text(draft_text)
             self.draft_ids = tokenizer.encode(draft_text, add_special_tokens=False)
         else:
             raise ValueError(
@@ -404,6 +572,10 @@ class ParsedDraftProvider:
                 "draft_ids or (draft_text + tokenizer)"
             )
         self.cursor: int = 0
+        # Consecutive-hold counter for the holdsnap cursor rule.
+        # Reset on any prefix-match or snap step; incremented on each
+        # held step. Bounded by the proposer's max_hold parameter.
+        self.consecutive_holds: int = 0
 
     def get_next_chunk(self, max_tokens: int) -> list[int]:
         """Return next chunk of draft token ids."""
@@ -448,6 +620,8 @@ class ParsedDraftProposer:
         self.chunk_size = spec_config.num_speculative_tokens
         self.strategy = spec_config.parsed_draft_strategy
         self.max_reject = spec_config.parsed_draft_max_reject
+        self.holdsnap = spec_config.parsed_draft_holdsnap
+        self.max_hold = spec_config.parsed_draft_max_hold
         self.lcs_backend = spec_config.parsed_draft_lcs_backend
         self._providers: dict[str, ParsedDraftProvider] = {}
         # Track which draft tokens were proposed per request so
@@ -471,10 +645,12 @@ class ParsedDraftProposer:
         logger.info(
             "ParsedDraftProposer initialized: "
             "chunk_size=%d, strategy=%s, max_reject=%d, "
-            "lcs_backend=%s",
+            "holdsnap=%s, max_hold=%d, lcs_backend=%s",
             self.chunk_size,
             self.strategy,
             self.max_reject,
+            self.holdsnap,
+            self.max_hold,
             self.lcs_backend,
         )
 
@@ -528,10 +704,22 @@ class ParsedDraftProposer:
         # ── Batched LCS advance ──
         if advance_indices:
             advances = self._compute_lcs_advances(advance_drafts, advance_gts)
-            for idx, adv in zip(advance_indices, advances):
+            for idx, adv, last_draft, sampled in zip(
+                advance_indices, advances, advance_drafts, advance_gts
+            ):
                 prov = providers[idx]
                 assert prov is not None
-                prov.advance(max(adv, 1))
+                if self.holdsnap:
+                    new_adv, prov.consecutive_holds = holdsnap_advance(
+                        last_draft,
+                        sampled,
+                        adv,
+                        prov.consecutive_holds,
+                        self.max_hold,
+                    )
+                    prov.advance(new_adv)
+                else:
+                    prov.advance(max(adv, 1))
 
         # ── Pass 2: Emit draft chunks ──
         draft_token_ids: list[list[int]] = []
@@ -566,9 +754,18 @@ class ParsedDraftProposer:
         'python':  per-request incremental DP (Phase 1).
         'numpy':   batched numpy vectorisation (Phase 2).
         'triton':  GPU Triton kernel (Phase 3).
+        'positional': DISABLES LCS — cursor advances by exactly
+            ``len(gt)`` (prefix_len + 1 for stop_at_first, bail_pos
+            for hybrid). Ablation only; OCR insertions/deletions
+            will permanently desync the cursor from the verifier.
         """
         backend = self.lcs_backend
         n = len(draft_list)
+
+        if backend == "positional":
+            # No LCS: assume draft and GT are positionally aligned and
+            # advance by the number of GT tokens consumed last step.
+            return [max(len(g), 1) for g in gt_list]
 
         if backend == "triton":
             from vllm.v1.spec_decode.utils import triton_lcs_advance
